@@ -178,6 +178,26 @@ const CATALOG_BY_NAME = Object.fromEntries(
   Object.values(ITEM_CATALOG).map((item) => [item.name, item])
 );
 
+// --- Forja (Módulo J) -------------------------------------------------------
+// Estilo MU Online: el tramo en el que está el ítem decide qué gema se gasta y
+// cuánto duele el fallo. La tabla vive en el servidor; el cliente solo pinta lo
+// que se le cuenta.
+const FORGE_TIERS = [
+  { from: 0, to: 5, gemKey: 'gem_light', chance: 1, failure: 'none' },
+  { from: 6, to: 8, gemKey: 'soul_sphere', chance: 0.7, failure: 'down' },
+  { from: 9, to: 14, gemKey: 'chaos_stone', chance: null, failure: 'reset' }
+];
+
+// Del +10 al +15 la probabilidad baja de 50% a 30%: la gema es la misma, pero
+// cada nivel cuesta más que el anterior.
+const CHAOS_CHANCE = { 10: 0.5, 11: 0.46, 12: 0.42, 13: 0.38, 14: 0.34, 15: 0.3 };
+
+// Costo en oro por intento: el nivel al que se aspira. El intento se paga aunque
+// la gema se rompa, así que el oro frena las tiradas a lo loco.
+const FORGE_GOLD_PER_LEVEL = 30;
+
+const MAX_ENHANCE_LEVEL = 15;
+
 // --- Comerciante (Módulo E) --------------------------------------------------
 // Un NPC fijo en el mapa. El servidor es la autoridad: valida distancia, oro y
 // espacio antes de mover un solo dato.
@@ -1273,6 +1293,90 @@ async function findFreeSlot(client, characterId) {
   return result.rows.length > 0 ? result.rows[0].slot : null;
 }
 
+// --- Forja: reglas y validación (Módulo J) -----------------------------------
+
+// Plan del siguiente intento: qué gema hace falta, con qué probabilidad se sube y
+// qué pasa si falla. Devuelve null cuando el ítem ya está en +15.
+function forgePlanFor(level) {
+  const actual = Number(level) || 0;
+  if (actual >= MAX_ENHANCE_LEVEL) return null;
+
+  const tier = FORGE_TIERS.find((candidato) => actual >= candidato.from && actual <= candidato.to);
+  if (!tier) return null;
+
+  const target = actual + 1;
+
+  return {
+    level: actual,
+    target,
+    gemKey: tier.gemKey,
+    gemName: ITEM_CATALOG[tier.gemKey].name,
+    chance: tier.chance === null ? CHAOS_CHANCE[target] : tier.chance,
+    failure: tier.failure,
+    gold: FORGE_GOLD_PER_LEVEL * target
+  };
+}
+
+// Solo se forjan piezas de equipo: una poción no tiene filo que afilar
+function isForgeable(item) {
+  return Boolean(EQUIP_SLOT_BY_TYPE[item.type]);
+}
+
+// Clave del catálogo de un ítem del inventario, por nombre de plantilla
+function catalogKeyOf(name) {
+  return Object.keys(ITEM_CATALOG).find((key) => ITEM_CATALOG[key].name === name) || null;
+}
+
+// Estado de un intento: se usa para pintar la ventana y para validar antes de
+// gastar nada. El cliente no calcula probabilidades: las pregunta.
+async function forgeInfoFor(player, itemId, gemItemId, runner = db) {
+  const rechazo = (reason, text) => ({ ok: false, reason, text, itemId, gemItemId });
+
+  const item = await loadInventoryItem(runner, itemId, player.characterId);
+  if (!item) return rechazo('no_item', 'Ese ítem ya no está en tu inventario.');
+  if (!isForgeable(item)) return rechazo('not_forgeable', `${item.name} no se puede forjar.`);
+
+  const plan = forgePlanFor(item.enhance_level);
+  if (!plan) return rechazo('max', `${item.name} ya está en +${MAX_ENHANCE_LEVEL}.`);
+
+  const gem = await loadInventoryItem(runner, gemItemId, player.characterId);
+  if (!gem) return rechazo('no_gem', 'Esa gema no está en tu inventario.');
+  if (gemItemId === itemId) return rechazo('same_item', 'El ítem y la gema tienen que ser distintos.');
+
+  if (catalogKeyOf(gem.name) !== plan.gemKey) {
+    return rechazo('wrong_gem', `Para el +${plan.target} hace falta ${plan.gemName}.`);
+  }
+
+  if (Number(player.gold) < plan.gold) {
+    return rechazo('no_gold', `Necesitas ${plan.gold} de oro para intentar el +${plan.target}.`);
+  }
+
+  return {
+    ok: true,
+    itemId,
+    gemItemId,
+    name: item.name,
+    level: plan.level,
+    target: plan.target,
+    chance: plan.chance,
+    failure: plan.failure,
+    gold: plan.gold,
+    gemKey: plan.gemKey,
+    gemName: plan.gemName
+  };
+}
+
+// Mensaje del chat con el resultado del intento
+function forgeOutcomeText(outcome) {
+  if (outcome.exito) return `${outcome.name} sube a +${outcome.nuevoNivel}.`;
+
+  if (outcome.failure === 'down') {
+    return `La forja falla: ${outcome.name} baja a +${outcome.nuevoNivel}.`;
+  }
+
+  return `La forja falla y ${outcome.name} vuelve a +0.`;
+}
+
 io.on('connection', async (socket) => {
   const char = socket.character || {};
   console.log(`🎮 Personaje conectado: ${char.name || socket.id}`);
@@ -1794,6 +1898,114 @@ io.on('connection', async (socket) => {
 
     notify(socket, `Desequipas ${unequippedName}.`);
     emitInventory(socket);
+  });
+
+  // La ventana de forja pregunta antes de gastar: probabilidad, gema y precio del
+  // siguiente intento para el ítem y la gema elegidos (Módulo J)
+  socket.on('requestForgeInfo', async (payload) => {
+    const player = players[socket.id];
+    if (!player || !player.characterId) return;
+
+    const itemId = payload && payload.itemId;
+    const gemItemId = payload && payload.gemItemId;
+    if (!itemId || !gemItemId) return;
+
+    socket.emit('forgeInfo', await forgeInfoFor(player, itemId, gemItemId));
+  });
+
+  // Forjar: la gema se gasta, el nivel sube o baja y el oro se cobra en la misma
+  // transacción. El dado lo tira el servidor: el cliente no tiene voto.
+  socket.on('enhanceItem', async (payload) => {
+    const player = players[socket.id];
+    if (!player || !player.characterId) return;
+
+    const itemId = payload && payload.itemId;
+    const gemItemId = payload && payload.gemItemId;
+    if (!itemId || !gemItemId) return;
+
+    if (itemId === gemItemId) return;
+
+    const client = await db.pool.connect();
+    let failure = null;
+    let outcome = null;
+
+    try {
+      await client.query('BEGIN');
+
+      // Bloquea la ficha: dos clics seguidos no pueden gastar el mismo oro ni la
+      // misma gema dos veces
+      await client.query('SELECT gold FROM characters WHERE id = $1 FOR UPDATE', [player.characterId]);
+
+      const info = await forgeInfoFor(player, itemId, gemItemId, client);
+
+      if (!info.ok) {
+        await client.query('ROLLBACK');
+        socket.emit('itemEnhanced', { success: false, itemId, gemItemId, reason: info.reason });
+        notify(socket, info.text, '#ff5252');
+        return;
+      }
+
+      // La tirada va aquí dentro, con la fila bloqueada: no hay ventana para
+      // repetir el intento entre la lectura y la escritura
+      const exito = Math.random() < info.chance;
+      const nuevoNivel = exito
+        ? info.target
+        : (info.failure === 'down' ? info.level - 1 : 0);
+
+      // 1. La gema se gasta siempre: en MU Online el intento se paga
+      await client.query(
+        'DELETE FROM inventory_items WHERE id = $1 AND character_id = $2',
+        [gemItemId, player.characterId]
+      );
+
+      // 2. El nivel del ítem cambia según la tirada
+      await client.query(
+        'UPDATE inventory_items SET enhance_level = $2 WHERE id = $1 AND character_id = $3',
+        [itemId, nuevoNivel, player.characterId]
+      );
+
+      // 3. El oro del intento
+      const oro = await client.query(
+        'UPDATE characters SET gold = gold - $2 WHERE id = $1 RETURNING gold',
+        [player.characterId, info.gold]
+      );
+
+      await client.query('COMMIT');
+
+      outcome = { ...info, exito, nuevoNivel, gold: Number(oro.rows[0].gold) };
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* ya revertida */ }
+      failure = error;
+    } finally {
+      client.release();
+    }
+
+    if (failure) {
+      console.error(`⚠️ Error al forjar en ${player.name}:`, failure.message);
+      notify(socket, 'No se pudo forjar el ítem.', '#ff5252');
+      return;
+    }
+
+    // El oro que se acaba de gastar también vive en memoria
+    player.gold = outcome.gold;
+
+    socket.emit('itemEnhanced', {
+      success: outcome.exito,
+      itemId,
+      gemItemId,
+      itemName: outcome.name,
+      previousLevel: outcome.level,
+      newLevel: outcome.nuevoNivel,
+      target: outcome.target,
+      chance: outcome.chance,
+      failure: outcome.failure,
+      gold: outcome.gold
+    });
+
+    notify(socket, forgeOutcomeText(outcome), outcome.exito ? '#ffd54f' : '#ff5252');
+
+    emitInventory(socket);
+    emitStats(socket);
   });
 
   // Comprar al comerciante (Módulo E, panel de tienda con la tecla E)
