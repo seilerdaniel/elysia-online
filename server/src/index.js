@@ -210,6 +210,11 @@ function grantCombatRewards(player, monster) {
 
   persistCharacterProgress(player);
 
+  // El XP y el oro cambian en cada muerte: el asesino tiene que verlo en su
+  // panel aunque no llegue a subir de nivel
+  const killerSocket = io.sockets.sockets.get(player.playerId);
+  if (killerSocket) emitStats(killerSocket);
+
   if (leveledUp) {
     io.emit('playerLeveledUp', {
       characterId: player.characterId,
@@ -217,10 +222,6 @@ function grantCombatRewards(player, monster) {
       level: player.level,
       statPoints: player.statPoints
     });
-
-    // El panel de personaje debe reflejar el nivel nuevo y los puntos ganados
-    const socket = io.sockets.sockets.get(player.playerId);
-    if (socket) emitStats(socket);
   }
 }
 
