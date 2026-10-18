@@ -3,10 +3,14 @@ import { io } from 'socket.io-client';
 import InventoryWindow from '../ui/InventoryWindow';
 import CharacterWindow from '../ui/CharacterWindow';
 import SettingsWindow from '../ui/SettingsWindow';
+import ShopWindow from '../ui/ShopWindow';
 import { findActionByKey, loadKeybinds, resolveKeyCode, saveKeybinds } from '../config/keybinds';
 
 // Debe coincidir con PICKUP_RANGE del servidor
 const PICKUP_RANGE = 40;
+
+// Debe coincidir con SHOP_RANGE del servidor
+const SHOP_RANGE = 50;
 
 export default class GameScene extends Phaser.Scene {
   constructor() {
@@ -15,10 +19,12 @@ export default class GameScene extends Phaser.Scene {
     this.otherPlayers = null;
     this.monstersGroup = null;
     this.worldDropSprites = null;
+    this.npcSprites = null;
     this.socket = null;
     this.inventoryWindow = null;
     this.characterWindow = null;
     this.settingsWindow = null;
+    this.shopWindow = null;
     this.playerStats = null;
     this.keybinds = null;
     this.chatInputHandlers = null;
@@ -85,6 +91,7 @@ export default class GameScene extends Phaser.Scene {
     this.otherPlayers = this.physics.add.group();
     this.monstersGroup = new Map();
     this.worldDropSprites = new Map();
+    this.npcSprites = new Map();
 
     // 4. Conectar WebSockets pasando Token JWT y datos del personaje
     this.socket = io('http://localhost:5000', {
@@ -114,6 +121,9 @@ export default class GameScene extends Phaser.Scene {
         saveKeybinds(keybinds);
       }
     });
+
+    // 8. Tienda del comerciante en Canvas (se abre con la tecla E junto al NPC)
+    this.shopWindow = new ShopWindow(this, this.socket);
 
     // --- Eventos de WebSockets: Jugadores ---
     this.socket.on('currentPlayers', (players) => {
@@ -226,19 +236,42 @@ export default class GameScene extends Phaser.Scene {
       this.removeWorldDrop(data.dropId);
     });
 
+    // --- Eventos de WebSockets: NPCs y comercio ---
+    this.socket.on('currentNpcs', (npcs) => {
+      npcs.forEach((npc) => this.addNpc(npc));
+    });
+
+    this.socket.on('shopCatalog', (catalog) => {
+      this.shopWindow.setCatalog(catalog);
+    });
+
+    this.socket.on('shopResult', (result) => {
+      this.shopWindow.showResult(result);
+
+      // El chat guarda el historial aunque la tienda esté cerrada
+      this.appendChatMessage({
+        sender: 'SISTEMA',
+        text: result.text,
+        color: result.ok ? '#a5d6a7' : '#ff8a80'
+      });
+    });
+
     // --- Eventos de WebSockets: Inventario ---
     this.socket.on('currentInventory', (items) => {
       this.inventoryWindow.setItems(items);
+      this.shopWindow.setBackpack(items);
     });
 
     this.socket.on('inventoryUpdated', (items) => {
       this.inventoryWindow.setItems(items);
+      this.shopWindow.setBackpack(items);
     });
 
     this.socket.on('playerStatsUpdated', (stats) => {
       this.playerStats = stats;
       this.inventoryWindow.setStats(stats);
       this.characterWindow.setStats(stats);
+      this.shopWindow.setStats(stats);
       this.updateInventoryPlayer(stats.level);
     });
 
@@ -266,7 +299,7 @@ export default class GameScene extends Phaser.Scene {
       }
     });
 
-    // 8. Configurar Teclado (Movimiento WASD / Flechas)
+    // 9. Configurar Teclado (Movimiento WASD / Flechas)
     this.cursors = this.input.keyboard.createCursorKeys();
     this.wasd = this.input.keyboard.addKeys({
       up: Phaser.Input.Keyboard.KeyCodes.W,
@@ -314,6 +347,9 @@ export default class GameScene extends Phaser.Scene {
         break;
       case 'pickup':
         this.pickUpNearestDrop();
+        break;
+      case 'shop':
+        this.toggleShop();
         break;
       case 'potionHp':
         this.usePotion('hp');
@@ -367,12 +403,13 @@ export default class GameScene extends Phaser.Scene {
     if (this.settingsWindow.toggle()) this.closeOtherWindows('settings');
   }
 
-  // Los tres paneles se dibujan centrados: solo uno puede estar visible a la vez
+  // Los cuatro paneles se dibujan centrados: solo uno puede estar visible a la vez
   closeOtherWindows(keep) {
     const panels = {
       inventory: this.inventoryWindow,
       character: this.characterWindow,
-      settings: this.settingsWindow
+      settings: this.settingsWindow,
+      shop: this.shopWindow
     };
 
     Object.entries(panels).forEach(([id, panel]) => {
@@ -578,6 +615,25 @@ export default class GameScene extends Phaser.Scene {
     });
   }
 
+  // NPC del mundo (Módulo E). El clic sobre él o la tecla de tienda abren el
+  // panel, pero solo si el jugador está cerca: el servidor lo revalida igual.
+  addNpc(npc) {
+    const sprite = this.add.sprite(npc.x, npc.y, 'merchant').setDepth(4);
+    sprite.npcId = npc.id;
+    sprite.setInteractive({ useHandCursor: true });
+    sprite.on('pointerdown', () => this.toggleShop());
+
+    const label = this.add.text(npc.x, npc.y - 26, `[${npc.name}]`, {
+      fontSize: '11px',
+      fill: '#ffd700',
+      fontStyle: 'bold',
+      stroke: '#000000',
+      strokeThickness: 2
+    }).setOrigin(0.5);
+
+    this.npcSprites.set(npc.id, { sprite, label });
+  }
+
   addWorldDrop(drop) {
     const sprite = this.add.sprite(drop.x, drop.y, drop.spriteId).setDepth(5);
     sprite.dropId = drop.dropId;
@@ -630,6 +686,39 @@ export default class GameScene extends Phaser.Scene {
     if (nearestDropId) {
       this.socket.emit('pickUpItem', { dropId: nearestDropId });
     }
+  }
+
+  // NPC más cercano dentro del rango de comercio, o null si no hay ninguno
+  nearestNpcInRange() {
+    if (!this.player) return null;
+
+    let nearest = null;
+    let nearestDistance = Infinity;
+
+    this.npcSprites.forEach((npc) => {
+      const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, npc.sprite.x, npc.sprite.y);
+
+      if (distance <= SHOP_RANGE && distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = npc;
+      }
+    });
+
+    return nearest;
+  }
+
+  toggleShop() {
+    // Comerciar exige estar junto al comerciante
+    if (!this.nearestNpcInRange()) {
+      this.appendChatMessage({
+        sender: 'SISTEMA',
+        text: 'No hay ningún comerciante cerca.',
+        color: '#ff5252'
+      });
+      return;
+    }
+
+    if (this.shopWindow.toggle()) this.closeOtherWindows('shop');
   }
 
   toggleChat() {
@@ -734,6 +823,11 @@ export default class GameScene extends Phaser.Scene {
     if (moved) {
       // Moverse cancela cualquier cierre de sesión en curso
       this.cancelLogoutIfPending();
+
+      // El comercio exige cercanía: alejarse del NPC cierra la tienda
+      if (this.shopWindow.isOpen && !this.nearestNpcInRange()) {
+        this.shopWindow.close();
+      }
 
       this.socket.emit('playerMovement', {
         x: this.player.x,
