@@ -143,6 +143,12 @@ const STAT_POINTS_POR_NIVEL = 5;
 const HP_POR_VITALIDAD = 10;
 const MP_POR_INTELIGENCIA = 8;
 const ASSIGNABLE_ATTRIBUTES = ['fuerza', 'agilidad', 'inteligencia', 'vitalidad'];
+
+// Cierre de sesión (Módulo F): en combate no se sale de inmediato, hay que
+// aguantar una cuenta regresiva que cualquier movimiento o ataque cancela.
+const LOGOUT_ACTIONS = ['select_character', 'exit'];
+const COMBAT_LOGOUT_BLOCK_MS = 10000; // Ventana de "seguimos peleando" desde el último golpe
+const LOGOUT_COUNTDOWN_SECONDS = 5;
 const ATTRIBUTE_LABELS = {
   fuerza: 'Fuerza',
   agilidad: 'Agilidad',
@@ -192,6 +198,54 @@ function grantCombatRewards(player, monster) {
     const socket = io.sockets.sockets.get(player.playerId);
     if (socket) emitStats(socket);
   }
+}
+
+// El jugador está en combate desde este instante: bloquea el cierre de sesión
+function markInCombat(player) {
+  if (player) player.lastCombatTime = Date.now();
+}
+
+// Moverse o atacar durante la cuenta regresiva cancela el cierre de sesión
+function cancelPendingLogout(player) {
+  if (!player || !player.pendingLogout) return;
+
+  clearTimeout(player.pendingLogout.timer);
+  player.pendingLogout = null;
+}
+
+// Persiste el estado del personaje, lo saca de la sala y confirma el cierre al
+// socket que lo pidió. El socket sigue abierto hasta que el cliente lo cierra:
+// así alcanza a recibir el logoutSuccess.
+async function finalizeLogout(socket, action) {
+  const player = players[socket.id];
+  if (!player) return;
+
+  cancelPendingLogout(player);
+
+  if (player.characterId) {
+    try {
+      await db.query(
+        `UPDATE characters
+            SET pos_x = $1, pos_y = $2, hp_current = $3, mp_current = $4,
+                experience = $5, gold = $6, stat_points = $7
+          WHERE id = $8`,
+        [
+          Math.round(player.x), Math.round(player.y),
+          player.hpCurrent, player.mpCurrent,
+          player.experience, player.gold, player.statPoints,
+          player.characterId
+        ]
+      );
+    } catch (error) {
+      console.error(`⚠️ No se pudo guardar la sesión de ${player.name}:`, error.message);
+    }
+  }
+
+  delete players[socket.id];
+  io.emit('playerDisconnected', socket.id);
+  socket.emit('logoutSuccess', { action });
+
+  console.log(`👋 ${player.name} cerró sesión (${action})`);
 }
 
 // Crea o refresca los templates de ítems en PostgreSQL y cachea sus ids en memoria.
@@ -430,7 +484,9 @@ io.on('connection', (socket) => {
     mpCurrent: Number(char.mp_current) || 0,
     mpMax: Number(char.mp_max) || 0,
     x: Math.floor(Math.random() * 300) + 250,
-    y: Math.floor(Math.random() * 200) + 200
+    y: Math.floor(Math.random() * 200) + 200,
+    lastCombatTime: 0,   // 0 = nunca ha combatido en esta sesión
+    pendingLogout: null  // cuenta regresiva de cierre de sesión en curso
   };
 
   // Enviar estado inicial al jugador entrante
@@ -445,11 +501,15 @@ io.on('connection', (socket) => {
 
   // Movimiento
   socket.on('playerMovement', (movementData) => {
-    if (players[socket.id]) {
-      players[socket.id].x = movementData.x;
-      players[socket.id].y = movementData.y;
-      socket.broadcast.emit('playerMoved', players[socket.id]);
-    }
+    const player = players[socket.id];
+    if (!player) return;
+
+    // Moverse cancela un cierre de sesión en curso
+    cancelPendingLogout(player);
+
+    player.x = movementData.x;
+    player.y = movementData.y;
+    socket.broadcast.emit('playerMoved', player);
   });
 
   // Combate (Ataque con Espacio)
@@ -457,12 +517,18 @@ io.on('connection', (socket) => {
     const player = players[socket.id];
     if (!player) return;
 
+    // Atacar cancela un cierre de sesión en curso, aunque no acierte
+    cancelPendingLogout(player);
+
     // Buscar monstruos vivos dentro del rango de ataque melee (60px)
     Object.values(monsters).forEach((m) => {
       if (!m.alive) return;
 
       const dist = Math.hypot(player.x - m.x, player.y - m.y);
       if (dist <= 60) {
+        // Golpear a alguien es lo que cuenta como estar en combate
+        markInCombat(player);
+
         const damage = Math.floor(Math.random() * 15) + 10; // Daño entre 10 y 25
         m.hp = Math.max(0, m.hp - damage);
 
@@ -826,9 +892,41 @@ io.on('connection', (socket) => {
     });
   });
 
+  // Cierre de sesión pedido desde el menú de opciones (tecla Esc)
+  socket.on('requestLogout', (payload) => {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const action = payload && payload.action;
+    if (!LOGOUT_ACTIONS.includes(action)) return;
+
+    // Ya hay una cuenta regresiva en marcha: no se reinicia
+    if (player.pendingLogout) return;
+
+    const inCombat = Date.now() - player.lastCombatTime < COMBAT_LOGOUT_BLOCK_MS;
+
+    if (!inCombat) {
+      finalizeLogout(socket, action);
+      return;
+    }
+
+    // En combate hay que esperar; moverse o atacar cancela la espera
+    player.pendingLogout = {
+      action,
+      timer: setTimeout(() => finalizeLogout(socket, action), LOGOUT_COUNTDOWN_SECONDS * 1000)
+    };
+
+    socket.emit('logoutCountdown', { seconds: LOGOUT_COUNTDOWN_SECONDS });
+  });
+
   // Desconexión
   socket.on('disconnect', () => {
-    console.log(`❌ Desconectado: ${players[socket.id]?.name}`);
+    const player = players[socket.id];
+
+    // Sin jugador en memoria ya se había cerrado sesión: no se repite el aviso
+    if (!player) return;
+
+    console.log(`❌ Desconectado: ${player.name}`);
     delete players[socket.id];
     io.emit('playerDisconnected', socket.id);
   });
