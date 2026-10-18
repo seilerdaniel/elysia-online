@@ -29,6 +29,21 @@ const CLAN_LABEL_COLOR = '#ffd700';
 const LABEL_BASE_Y = 25;
 const CLAN_LABEL_GAP = 13;
 
+// --- Mundo por mapas (Módulo I) -----------------------------------------------
+// Cada mapa ocupa una cuadrícula de 100 x 100 tiles de 32 px. El servidor usa
+// los mismos 3200 px como límites del mundo, así que estas cifras se mueven
+// juntas: si una cambia, la otra deja de cuadrar.
+const TILE_SIZE = 32;
+const TILES_PER_SIDE = 100;
+const MAP_SIZE = TILE_SIZE * TILES_PER_SIDE; // 3200 x 3200 px
+
+// Aspecto del suelo por mapa. El tinte es lo que hace evidente que se ha
+// cambiado de zona antes de leer el nombre del mapa.
+const MAP_STYLES = {
+  1: { tint: null, road: true },        // Ciudad de Ullathorpe: camino de piedra
+  2: { tint: 0x86a98f, road: false }    // Bosque Nublado: hierba apagada
+};
+
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super('GameScene');
@@ -48,6 +63,8 @@ export default class GameScene extends Phaser.Scene {
     this.projectiles = null;
     this.skillInfo = null;
     this.localBars = null;
+    this.terrain = null;
+    this.mapId = 1;
     this.localLabelOffset = 0;
     this.speed = 160;
     this.isChatting = false;
@@ -101,13 +118,10 @@ export default class GameScene extends Phaser.Scene {
     // lienzo y el socket deben soltarse en el apagado, no al cerrar la página
     this.events.once('shutdown', () => this.cleanup());
 
-    // 3. Renderizar el Terreno (Grilla 25x20 tiles)
-    for (let x = 0; x < 25; x++) {
-      for (let y = 0; y < 20; y++) {
-        const isStone = (x === 12 || y === 10);
-        this.add.image(x * 32 + 16, y * 32 + 16, isStone ? 'stone' : 'grass');
-      }
-    }
+    // 3. Terreno del mapa y límites del mundo (100 x 100 tiles)
+    this.buildTerrain(this.mapId);
+    this.physics.world.setBounds(0, 0, MAP_SIZE, MAP_SIZE);
+    this.cameras.main.setBounds(0, 0, MAP_SIZE, MAP_SIZE);
 
     this.otherPlayers = this.physics.add.group();
     this.monstersGroup = new Map();
@@ -152,6 +166,16 @@ export default class GameScene extends Phaser.Scene {
 
     this.socket.on('clanInfo', (state) => this.clanWindow.setClanState(state));
     this.socket.on('clanInviteReceived', (invite) => this.clanWindow.addInvite(invite));
+
+    // 10. Los paneles son HUD: siguen anclados a la pantalla aunque la cámara
+    // siga al personaje por un mundo de 3200 px
+    [
+      this.inventoryWindow,
+      this.characterWindow,
+      this.settingsWindow,
+      this.shopWindow,
+      this.clanWindow
+    ].forEach((panel) => this.pinToScreen(panel));
 
     // --- Eventos de WebSockets: Jugadores ---
     this.socket.on('currentPlayers', (players) => {
@@ -581,9 +605,53 @@ export default class GameScene extends Phaser.Scene {
     });
   }
 
+  // --- Mundo y HUD (Módulo I) --------------------------------------------------
+
+  // Dibuja el suelo del mapa. Un único TileSprite cubre los 100 x 100 tiles: con
+  // imágenes individuales serían 10.000 objetos de render para un fondo que no
+  // cambia nunca.
+  buildTerrain(mapId) {
+    if (this.terrain) {
+      this.terrain.destroy(true);
+      this.terrain = null;
+    }
+
+    const style = MAP_STYLES[mapId] || MAP_STYLES[1];
+    const layers = [];
+
+    const grass = this.add.tileSprite(0, 0, MAP_SIZE, MAP_SIZE, 'grass').setOrigin(0);
+    if (style.tint) grass.setTint(style.tint);
+
+    layers.push(grass);
+
+    // Camino de piedra en cruz por el centro: es la referencia visual que tenía
+    // el mapa pequeño y sirve para orientarse en uno de 100 x 100 tiles
+    if (style.road) {
+      layers.push(this.add.tileSprite(
+        0, MAP_SIZE / 2 - TILE_SIZE / 2, MAP_SIZE, TILE_SIZE, 'stone'
+      ).setOrigin(0));
+
+      layers.push(this.add.tileSprite(
+        MAP_SIZE / 2 - TILE_SIZE / 2, 0, TILE_SIZE, MAP_SIZE, 'stone'
+      ).setOrigin(0));
+    }
+
+    this.terrain = this.add.container(0, 0, layers).setDepth(-10);
+  }
+
+  // Ancla un panel a la pantalla. Phaser aplica el scrollFactor al contenedor
+  // pero no a sus hijos salvo que se le pida (updateChildren): sin eso el marco
+  // se quedaría quieto y el contenido se iría con el mundo.
+  pinToScreen(panel) {
+    if (panel && panel.container) panel.container.setScrollFactor(0, 0, true);
+  }
+
   addLocalPlayer(playerInfo) {
     this.player = this.physics.add.sprite(playerInfo.x, playerInfo.y, 'player');
     this.player.setCollideWorldBounds(true);
+
+    // La cámara sigue al personaje local con un suavizado (Módulo I)
+    this.cameras.main.startFollow(this.player, true, 0.08, 0.08);
     this.player.playerId = playerInfo.playerId;
     this.player.characterId = playerInfo.characterId;
     this.player.playerName = playerInfo.name;
