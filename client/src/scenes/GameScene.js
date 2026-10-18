@@ -44,6 +44,14 @@ const MAP_STYLES = {
   2: { tint: 0x86a98f, road: false }    // Bosque Nublado: hierba apagada
 };
 
+// Portales (Módulo I). El aro marca dónde se viaja y el nombre dice a dónde: los
+// dos datos los manda el servidor al entrar en la zona.
+const PORTAL_COLOR = 0x66fcf1;
+const PORTAL_LABEL_COLOR = '#66fcf1';
+
+// Duración del fundido de entrada y de salida al cambiar de mapa
+const FADE_MS = 300;
+
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super('GameScene');
@@ -65,6 +73,13 @@ export default class GameScene extends Phaser.Scene {
     this.localBars = null;
     this.terrain = null;
     this.mapId = 1;
+    this.mapInfo = null;
+    this.portals = [];
+    this.portalLayer = null;
+    this.travelling = false;
+    this.blockedPortalId = null;
+    this.travelTimer = null;
+    this.travelGuardTimer = null;
     this.localLabelOffset = 0;
     this.speed = 160;
     this.isChatting = false;
@@ -372,6 +387,17 @@ export default class GameScene extends Phaser.Scene {
       });
     });
 
+    // --- Eventos de WebSockets: Mapas y portales (Módulo I) ---
+    // La zona la manda el servidor: al entrar llega mapInfo y al viajar llega
+    // mapChangeSuccess con el mapa entero ya montado.
+    this.socket.on('mapInfo', (info) => this.applyMap(info));
+
+    this.socket.on('mapChangeSuccess', (data) => this.onMapChangeSuccess(data));
+
+    // El portal no se activó: se vuelve a ver el mapa y no se insiste hasta salir
+    // del aro, o el personaje se quedaría rebotando en la puerta
+    this.socket.on('mapChangeDenied', () => this.cancelTravel());
+
     // --- Eventos de WebSockets: Inventario ---
     this.socket.on('currentInventory', (items) => {
       this.inventoryWindow.setItems(items);
@@ -571,6 +597,16 @@ export default class GameScene extends Phaser.Scene {
     // bucle de Phaser (el juego quedaría congelado).
     this.player = null;
 
+    // El viaje vive fuera de la escena: un temporizador o un aro viejos no deben
+    // sobrevivir al reinicio (el escenario que los dibujó ya no existe)
+    this.clearTravelTimers();
+    this.travelling = false;
+    this.blockedPortalId = null;
+    this.portals = [];
+    this.portalLayer = null;
+    this.mapInfo = null;
+    this.terrain = null;
+
     const chatWrapper = document.getElementById('chat-wrapper');
     const chatInput = document.getElementById('chat-input');
 
@@ -644,6 +680,182 @@ export default class GameScene extends Phaser.Scene {
   // se quedaría quieto y el contenido se iría con el mundo.
   pinToScreen(panel) {
     if (panel && panel.container) panel.container.setScrollFactor(0, 0, true);
+  }
+
+  // --- Viaje entre zonas (Módulo I) -------------------------------------------
+
+  // El servidor manda la zona en la que estamos: nombre, tamaño y puertas. El
+  // cliente no adivina nada, dibuja lo que recibe.
+  applyMap(info) {
+    if (!info) return;
+
+    this.mapId = info.mapId;
+    this.mapInfo = info;
+    this.buildTerrain(info.mapId);
+    this.drawPortals(info.portals || []);
+  }
+
+  // Aro y nombre de cada puerta de la zona
+  drawPortals(portals) {
+    if (this.portalLayer) {
+      this.portalLayer.destroy(true);
+      this.portalLayer = null;
+    }
+
+    this.portals = portals;
+    const piezas = [];
+
+    portals.forEach((portal) => {
+      const aro = this.add
+        .circle(portal.x, portal.y, portal.radius, PORTAL_COLOR, 0.16)
+        .setStrokeStyle(3, PORTAL_COLOR, 0.85);
+
+      const nombre = this.add.text(portal.x, portal.y - portal.radius - 16, portal.name, {
+        fontSize: '13px',
+        fill: PORTAL_LABEL_COLOR,
+        fontStyle: 'bold',
+        stroke: '#000000',
+        strokeThickness: 3
+      }).setOrigin(0.5);
+
+      piezas.push(aro, nombre);
+    });
+
+    // Por debajo de los personajes y de los monstruos, por encima del suelo
+    this.portalLayer = this.add.container(0, 0, piezas).setDepth(-5);
+  }
+
+  insidePortal(portal) {
+    return Phaser.Math.Distance.Between(
+      this.player.x, this.player.y, portal.x, portal.y
+    ) <= portal.radius;
+  }
+
+  // Un temporizador del viaje que quede vivo ensucia el mapa siguiente: se
+  // cancelan todos a la vez.
+  clearTravelTimers() {
+    [this.travelTimer, this.travelGuardTimer].forEach((temporizador) => {
+      if (temporizador) temporizador.remove(false);
+    });
+
+    this.travelTimer = null;
+    this.travelGuardTimer = null;
+  }
+
+  // Pisar el aro pide el viaje. El servidor comprueba la distancia con sus
+  // propias coordenadas: esto solo es la intención del cliente.
+  checkPortal() {
+    if (this.travelling || !this.portals.length) return;
+
+    const portal = this.portals.find((candidato) => this.insidePortal(candidato));
+
+    // Fuera del aro el portal vuelve a estar disponible: así se puede volver a
+    // intentar el viaje después de un rechazo
+    if (!portal) {
+      this.blockedPortalId = null;
+      return;
+    }
+
+    if (portal.id === this.blockedPortalId) return;
+
+    this.travelling = true;
+    this.blockedPortalId = portal.id;
+
+    // El fundido tapa el salto: el viaje se pide cuando la pantalla ya está negra
+    this.cameras.main.fadeOut(FADE_MS, 0, 0, 0, (camera, progress) => {
+      if (progress < 1) return;
+      this.socket.emit('requestMapChange', { targetMapId: portal.targetMapId });
+    });
+
+    // Red de seguridad: si el servidor no contesta, se vuelve a ver el mapa
+    this.travelGuardTimer = this.time.delayedCall(FADE_MS + 2500, () => this.cancelTravel());
+  }
+
+  // Viaje rechazado o sin respuesta: se levanta el fundido y se sigue jugando
+  cancelTravel() {
+    if (!this.travelling) return;
+
+    this.travelling = false;
+    this.clearTravelTimers();
+
+    this.cameras.main.fadeIn(FADE_MS, 0, 0, 0);
+  }
+
+  // Confirmación del servidor: se tira el escenario viejo y se levanta el nuevo
+  // con lo que trae el propio mensaje, sin estados a medias.
+  onMapChangeSuccess(data) {
+    this.travelling = false;
+    this.clearTravelTimers();
+
+    this.clearMapEntities();
+    this.applyMap(data);
+
+    const propio = (data.players || {})[this.socket.id];
+
+    // El personaje local no se recrea: se le mueve, así conserva las barras, el
+    // seguimiento de la cámara y su etiqueta
+    if (this.player) {
+      this.player.setPosition(data.x, data.y);
+
+      if (propio) {
+        this.player.playerName = propio.name;
+        this.player.faction = propio.faction;
+        this.player.hero = Boolean(propio.hero);
+        this.setClanLabel(this.player, propio, true);
+
+        if (this.player.nameText) this.player.nameText.setColor(this.factionColor(propio));
+      }
+
+      this.placeOverheadLabels(this.player);
+      this.updateLocalBars();
+    }
+
+    Object.keys(data.players || {}).forEach((id) => {
+      if (id !== this.socket.id) this.addOtherPlayer(data.players[id]);
+    });
+
+    Object.values(data.monsters || {}).forEach((monster) => {
+      if (monster.alive) this.addMonster(monster);
+    });
+
+    (data.drops || []).forEach((drop) => this.addWorldDrop(drop));
+    (data.npcs || []).forEach((npc) => this.addNpc(npc));
+
+    this.cameras.main.fadeIn(FADE_MS, 0, 0, 0);
+  }
+
+  // Vacía todo lo que pertenece al mapa que se deja atrás. El personaje local se
+  // queda: es el viajero.
+  clearMapEntities() {
+    this.otherPlayers.getChildren().slice().forEach((otherPlayer) => {
+      if (otherPlayer.nameText) otherPlayer.nameText.destroy();
+      if (otherPlayer.clanText) otherPlayer.clanText.destroy();
+      if (otherPlayer.speechBubble) otherPlayer.speechBubble.destroy();
+      otherPlayer.destroy();
+    });
+
+    this.monstersGroup.forEach((monster) => {
+      monster.sprite.destroy();
+      monster.nameText.destroy();
+      monster.hpBg.destroy();
+      monster.hpBar.destroy();
+    });
+    this.monstersGroup.clear();
+
+    Array.from(this.worldDropSprites.keys()).forEach((dropId) => this.removeWorldDrop(dropId));
+
+    this.npcSprites.forEach((npc) => {
+      npc.sprite.destroy();
+      npc.label.destroy();
+    });
+    this.npcSprites.clear();
+
+    // Un proyectil en vuelo no cruza un portal: se apaga con el mapa
+    this.projectiles.forEach((projectile) => {
+      projectile.sprite.destroy();
+      projectile.trail.destroy();
+    });
+    this.projectiles.clear();
   }
 
   addLocalPlayer(playerInfo) {
@@ -1337,5 +1549,8 @@ export default class GameScene extends Phaser.Scene {
         y: this.player.y
       });
     }
+
+    // Un portal se activa al pisarlo; el servidor vuelve a comprobar la distancia
+    this.checkPortal();
   }
 }
