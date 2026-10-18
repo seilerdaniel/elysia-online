@@ -251,6 +251,20 @@ const REGEN_MP_RATIO = 0.05;
 const RESPAWN_X = 400;
 const RESPAWN_Y = 320;
 
+// --- Karma y bando (Módulo H) ---
+// El bando que se guarda en la base de datos solo tiene tres valores y se deriva
+// del karma: caer por debajo de cero convierte en Renegado y pasar del umbral de
+// héroe devuelve a Ciudadano. El brillo de héroe es el tramo alto del mismo bando.
+const KARMA_CRIMINAL = 0;
+const KARMA_HERO = 100;
+
+// Cuánto mueve el karma cada acción de armas
+const KARMA_HIT_CITIZEN = -2;    // golpear a un ciudadano sin ser renegado
+const KARMA_DOWN_CITIZEN = -25;  // derribarlo
+const KARMA_DOWN_NEUTRAL = -10;  // derribar a quien no tiene bando declarado
+const KARMA_DOWN_RENEGADE = 15;  // dar caza a un renegado
+const KARMA_MONSTER_KILL = 2;    // cazar monstruos redime
+
 // Guarda experiencia, oro, nivel y puntos de estadística del personaje en PostgreSQL
 async function persistCharacterProgress(player) {
   if (!player.characterId) return;
@@ -500,7 +514,12 @@ function damageMonster(monster, damage, player, options = {}) {
   });
 
   // Sin dueño (se desconectó a mitad de vuelo) no hay recompensas que dar
-  if (player) grantCombatRewards(player, monster);
+  if (player) {
+    grantCombatRewards(player, monster);
+
+    // Cazar monstruos redime: es la vía pacífica de recuperar el bando
+    applyKarma(player, KARMA_MONSTER_KILL);
+  }
 
   spawnDrop(monster);
 
@@ -554,10 +573,19 @@ function damagePlayer(target, damage, attacker, options = {}) {
     skillId: options.skillId || null
   });
 
+  // Golpear a un ciudadano sin ser renegado mancha el karma; un renegado ya no
+  // tiene nada que perder
+  if (attacker && target.faction === 'Ciudadano' && attacker.faction !== 'Renegado') {
+    applyKarma(attacker, KARMA_HIT_CITIZEN);
+  }
+
   const targetSocket = io.sockets.sockets.get(target.playerId);
   if (targetSocket) emitStats(targetSocket);
 
   if (target.hpCurrent > 0) return false;
+
+  // Derribar también mueve el karma, según el bando de la víctima
+  if (attacker) applyKarma(attacker, karmaForDown(target));
 
   // Derribado: vuelve al centro del mapa con la vida y el maná enteros
   target.hpCurrent = target.hpMax;
@@ -814,6 +842,112 @@ function regeneratePlayers() {
   });
 }
 
+// --- Karma y bando (Módulo H) ------------------------------------------------
+
+// Bando que le corresponde a un karma
+function factionForKarma(karma) {
+  if (karma < KARMA_CRIMINAL) return 'Renegado';
+  if (karma > KARMA_CRIMINAL) return 'Ciudadano';
+
+  return 'Neutral';
+}
+
+// Un héroe es un ciudadano con el karma muy alto: el bando guardado no cambia,
+// pero el nombre se pinta en dorado
+function isHero(player) {
+  return Boolean(player) && player.karma > KARMA_HERO;
+}
+
+// Estado de bando que viaja a los clientes para pintar el nombre
+function publicFaction(player) {
+  return {
+    playerId: player.playerId,
+    characterId: player.characterId,
+    faction: player.faction,
+    karma: player.karma,
+    hero: isHero(player)
+  };
+}
+
+// Aviso privado a un jugador, esté donde esté su socket
+function notifyPlayer(player, text, color = '#ffeb3b') {
+  if (!player) return;
+
+  const socket = io.sockets.sockets.get(player.playerId);
+  if (socket) notify(socket, text, color);
+}
+
+// Persiste karma y bando: es el único sitio donde se escriben esas columnas
+async function persistKarma(player) {
+  if (!player || !player.characterId) return;
+
+  try {
+    await db.query(
+      'UPDATE characters SET karma = $1, faction = $2 WHERE id = $3',
+      [player.karma, player.faction, player.characterId]
+    );
+  } catch (error) {
+    console.error(`⚠️ No se pudo guardar el karma de ${player.name}:`, error.message);
+  }
+}
+
+// Mueve el karma y, si el bando cambia, lo anuncia a todos para que los nombres
+// se repinten al instante
+function applyKarma(player, delta) {
+  if (!player || !delta) return;
+
+  player.karma += delta;
+
+  const previous = player.faction;
+  player.faction = factionForKarma(player.karma);
+
+  persistKarma(player);
+  io.emit('playerFactionUpdated', publicFaction(player));
+
+  // El panel del personaje muestra el karma: hay que refrescarlo también
+  const socket = io.sockets.sockets.get(player.playerId);
+  if (socket) emitStats(socket);
+
+  if (player.faction !== previous) {
+    const criminal = player.faction === 'Renegado';
+
+    notifyPlayer(
+      player,
+      criminal
+        ? 'Tu karma ha caído por debajo de cero: ahora eres un RENEGADO.'
+        : `Tu bando ha cambiado a ${player.faction}.`,
+      criminal ? '#ff5252' : '#ffd700'
+    );
+  }
+}
+
+// Karma que mueve derribar a alguien, según el bando de la víctima
+function karmaForDown(victim) {
+  if (!victim) return 0;
+  if (victim.faction === 'Renegado') return KARMA_DOWN_RENEGADE;
+  if (victim.faction === 'Ciudadano') return KARMA_DOWN_CITIZEN;
+
+  return KARMA_DOWN_NEUTRAL;
+}
+
+// Estado del personaje que decide el servidor. El cliente elige la ficha, pero no
+// su karma ni su bando: eso lo manda la base de datos.
+async function loadCharacterState(characterId) {
+  if (!characterId) return null;
+
+  try {
+    const result = await db.query(
+      'SELECT karma, faction FROM characters WHERE id = $1',
+      [characterId]
+    );
+
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error('⚠️ No se pudo leer el estado del personaje:', error.message);
+    return null;
+  }
+}
+
 // --- Inventario -------------------------------------------------------------
 
 const INVENTORY_QUERY = `
@@ -884,6 +1018,8 @@ function emitStats(socket) {
     agilidad: player.agilidad,
     inteligencia: player.inteligencia,
     vitalidad: player.vitalidad,
+    karma: player.karma,
+    faction: player.faction,
     hpCurrent: player.hpCurrent,
     hpMax: player.hpMax,
     mpCurrent: player.mpCurrent,
@@ -910,6 +1046,9 @@ function publicPlayer(player) {
     name: player.name,
     characterClass: player.characterClass,
     level: player.level,
+    faction: player.faction,
+    karma: player.karma,
+    hero: isHero(player),
     x: player.x,
     y: player.y
   };
@@ -1006,9 +1145,13 @@ async function findFreeSlot(client, characterId) {
   return result.rows.length > 0 ? result.rows[0].slot : null;
 }
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   const char = socket.character || {};
   console.log(`🎮 Personaje conectado: ${char.name || socket.id}`);
+
+  // El karma y el bando son estado de juego: los decide el servidor y se leen de
+  // la base de datos, no de lo que cuente el cliente en el handshake.
+  const stored = await loadCharacterState(char.id);
 
   // La posición se guarda al cerrar sesión (Módulo F): al volver, el personaje
   // aparece donde quedó. Sin coordenadas válidas cae al centro del mapa.
@@ -1035,6 +1178,8 @@ io.on('connection', (socket) => {
     mpMax: Number(char.mp_max) || 0,
     x: Number.isFinite(spawnX) ? spawnX : 400,
     y: Number.isFinite(spawnY) ? spawnY : 320,
+    karma: stored ? Number(stored.karma) || 0 : 0,
+    faction: (stored && stored.faction) || 'Neutral',
     lastCombatTime: 0,   // 0 = nunca ha combatido en esta sesión
     pendingLogout: null, // cuenta regresiva de cierre de sesión en curso
     skillReadyAt: 0      // momento (ms) en que la habilidad vuelve a estar lista
