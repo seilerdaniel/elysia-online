@@ -937,11 +937,14 @@ io.on('connection', (socket) => {
   });
 });
 
-// Resolver los templates de ítems en PostgreSQL antes de aceptar jugadores
-ensureItemTemplates().catch((error) => {
-  console.error('⚠️ No se pudieron preparar los templates de ítems:', error.message);
-});
-
-server.listen(PORT, () => {
-  console.log(`🚀 Servidor Elysia Online activo en http://localhost:${PORT}`);
-});
+// Resolver los templates de ítems en PostgreSQL antes de aceptar jugadores: si
+// no, los templateId llegarían vacíos y ni recoger ni comprar funcionarían.
+ensureItemTemplates()
+  .catch((error) => {
+    console.error('⚠️ No se pudieron preparar los templates de ítems:', error.message);
+  })
+  .finally(() => {
+    server.listen(PORT, () => {
+      console.log(`🚀 Servidor Elysia Online activo en http://localhost:${PORT}`);
+    });
+  });
