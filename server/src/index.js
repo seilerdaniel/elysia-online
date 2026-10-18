@@ -465,6 +465,11 @@ io.on('connection', (socket) => {
   const char = socket.character || {};
   console.log(`🎮 Personaje conectado: ${char.name || socket.id}`);
 
+  // La posición se guarda al cerrar sesión (Módulo F): al volver, el personaje
+  // aparece donde quedó. Sin coordenadas válidas cae al centro del mapa.
+  const spawnX = Number(char.pos_x);
+  const spawnY = Number(char.pos_y);
+
   players[socket.id] = {
     playerId: socket.id,
     userId: socket.user.userId,
@@ -483,8 +488,8 @@ io.on('connection', (socket) => {
     hpMax: Number(char.hp_max) || 0,
     mpCurrent: Number(char.mp_current) || 0,
     mpMax: Number(char.mp_max) || 0,
-    x: Math.floor(Math.random() * 300) + 250,
-    y: Math.floor(Math.random() * 200) + 200,
+    x: Number.isFinite(spawnX) ? spawnX : 400,
+    y: Number.isFinite(spawnY) ? spawnY : 320,
     lastCombatTime: 0,   // 0 = nunca ha combatido en esta sesión
     pendingLogout: null  // cuenta regresiva de cierre de sesión en curso
   };
