@@ -10,6 +10,8 @@ export default class BootScene extends Phaser.Scene {
     this.createPixelTextures();
     // Generar texturas de los ítems que caen al suelo (16x16)
     this.createItemTextures();
+    // Generar texturas de proyectiles y destellos de habilidad (Módulo G)
+    this.createProjectileTextures();
   }
 
   create() {
@@ -192,5 +194,47 @@ export default class BootScene extends Phaser.Scene {
     ctxChaos.fillStyle = '#ff1744'; // Núcleo
     ctxChaos.fillRect(7, 7, 2, 2);
     chaosCanvas.refresh();
+  }
+
+  // Proyectiles y destellos de las habilidades de clase (Módulo G)
+  createProjectileTextures() {
+    // Bola arcana del Mago: orbe azul con núcleo blanco
+    const arcaneCanvas = this.textures.createCanvas('proj_arcane', 12, 12);
+    const ctxArcane = arcaneCanvas.getContext();
+    ctxArcane.fillStyle = '#1565c0';
+    ctxArcane.fillRect(3, 2, 6, 8);
+    ctxArcane.fillRect(2, 3, 8, 6);
+    ctxArcane.fillStyle = '#42a5f5';
+    ctxArcane.fillRect(3, 3, 6, 6);
+    ctxArcane.fillStyle = '#90caf9';
+    ctxArcane.fillRect(4, 4, 3, 3);
+    ctxArcane.fillStyle = '#e3f2fd'; // Núcleo
+    ctxArcane.fillRect(5, 5, 2, 2);
+    arcaneCanvas.refresh();
+
+    // Flecha del Cazador: apunta a la derecha, que es el ángulo cero
+    const arrowCanvas = this.textures.createCanvas('proj_arrow', 16, 8);
+    const ctxArrow = arrowCanvas.getContext();
+    ctxArrow.fillStyle = '#8d6e63'; // Asta
+    ctxArrow.fillRect(0, 3, 11, 2);
+    ctxArrow.fillStyle = '#bdbdbd'; // Punta
+    ctxArrow.fillRect(11, 2, 2, 4);
+    ctxArrow.fillRect(13, 3, 1, 2);
+    ctxArrow.fillStyle = '#e0e0e0'; // Plumas
+    ctxArrow.fillRect(0, 1, 2, 2);
+    ctxArrow.fillRect(0, 5, 2, 2);
+    arrowCanvas.refresh();
+
+    // Chispa: alimenta el rastro de los proyectiles y los impactos
+    const sparkCanvas = this.textures.createCanvas('proj_spark', 6, 6);
+    const ctxSpark = sparkCanvas.getContext();
+    ctxSpark.fillStyle = '#81d4fa';
+    ctxSpark.fillRect(1, 1, 1, 1);
+    ctxSpark.fillRect(4, 1, 1, 1);
+    ctxSpark.fillRect(1, 4, 1, 1);
+    ctxSpark.fillRect(4, 4, 1, 1);
+    ctxSpark.fillStyle = '#e1f5fe'; // Centro
+    ctxSpark.fillRect(2, 2, 2, 2);
+    sparkCanvas.refresh();
   }
 }

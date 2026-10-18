@@ -12,8 +12,13 @@ export const RESERVED_KEYS = {
 };
 
 // Acciones reasignables, en el orden en que se muestran en el menú
+//
+// La habilidad de clase va en 3 y no en 1/2 porque las pociones ya viven ahí
+// desde el Módulo E: moverlas habría roto los atajos que los jugadores tengan
+// guardados. El clic derecho sobre el mapa lanza la habilidad igual, apuntando.
 export const KEYBIND_ACTIONS = [
   { id: 'attack', label: 'Atacar', defaultKey: 'Space' },
+  { id: 'skill', label: 'Habilidad', defaultKey: 'Digit3' },
   { id: 'inventory', label: 'Inventario', defaultKey: 'KeyI' },
   { id: 'character', label: 'Personaje', defaultKey: 'KeyC' },
   { id: 'pickup', label: 'Recoger', defaultKey: 'KeyG' },

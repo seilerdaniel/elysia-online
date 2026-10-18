@@ -7,11 +7,11 @@ import {
 } from '../config/keybinds';
 
 // --- Geometría del panel -----------------------------------------------------
-// La tabla de controles manda: con 8 acciones la última caja acaba en
-// ROW_START_Y + 7 * ROW_STEP + KEY_BOX_HEIGHT / 2 = 291, así que el separador
+// La tabla de controles manda: con 9 acciones la última caja acaba en
+// ROW_START_Y + 8 * ROW_STEP + KEY_BOX_HEIGHT / 2 = 321, así que el separador
 // de sesión, sus botones y el aviso van por debajo de esa línea.
 const PANEL_WIDTH = 440;
-const PANEL_HEIGHT = 402;
+const PANEL_HEIGHT = 432;
 
 const TITLE_Y = 20;
 const CONTROLS_LABEL_Y = 46;
@@ -24,16 +24,16 @@ const KEY_BOX_WIDTH = 130;
 const KEY_BOX_HEIGHT = 22;
 const KEY_BOX_RIGHT = PANEL_WIDTH - ROW_LABEL_X;
 
-const SEPARATOR_Y = 312;
-const SESSION_LABEL_Y = 329;
+const SEPARATOR_Y = 342;
+const SESSION_LABEL_Y = 359;
 
-const BUTTON_Y = 352;
+const BUTTON_Y = 382;
 const BUTTON_WIDTH = 192;
 const BUTTON_HEIGHT = 30;
 const BUTTON_LEFT_X = ROW_LABEL_X;
 const BUTTON_RIGHT_X = PANEL_WIDTH - ROW_LABEL_X - BUTTON_WIDTH;
 
-const NOTICE_Y = 383;
+const NOTICE_Y = 413;
 
 // --- Paleta ------------------------------------------------------------------
 const COLOR_PANEL_BG = 0x0b0c10;
