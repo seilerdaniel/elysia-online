@@ -180,6 +180,77 @@ const ATTRIBUTE_LABELS = {
   vitalidad: 'Vitalidad'
 };
 
+// --- Habilidades de clase (Módulo G) -----------------------------------------
+// Una habilidad por clase. El daño sale del atributo propio de cada una, así que
+// subir de nivel y repartir puntos se nota al pelear.
+const SKILLS = {
+  Mago: {
+    id: 'arcane_missile',
+    name: 'Misil Arcano',
+    kind: 'projectile',
+    projectile: 'arcane',
+    mpCost: 15,
+    cooldownMs: 1200,
+    speed: 320,
+    range: 420,
+    damage: (player) => player.inteligencia * 1.8
+  },
+  Cazador: {
+    id: 'true_shot',
+    name: 'Disparo Certero',
+    kind: 'projectile',
+    projectile: 'arrow',
+    mpCost: 10,
+    cooldownMs: 900,
+    speed: 560,
+    range: 520,
+    damage: (player) => player.agilidad * 1.5
+  },
+  Guerrero: {
+    id: 'vorpal_slash',
+    name: 'Corte Vorpal',
+    kind: 'arc',
+    mpCost: 10,
+    cooldownMs: 2500,
+    range: 80,                    // Abanico de 80 px
+    arcHalfAngle: Math.PI / 3,    // ...y 120º de apertura total
+    critChance: 0.2,              // 20% de impacto crítico
+    critMultiplier: 2,
+    damage: (player) => player.fuerza * 1.8
+  },
+  Asesino: {
+    id: 'shadow_strike',
+    name: 'Ataque Sombrío',
+    kind: 'blink',
+    mpCost: 12,
+    cooldownMs: 3000,
+    blinkDistance: 100,           // Salto corto hacia el cursor
+    hitRange: 60,                 // Alcance del golpe garantizado
+    damage: (player) => player.agilidad * 1.4
+  }
+};
+
+// Proyectiles vivos, indexados por id. Los simula el servidor: el cliente solo
+// dibuja lo que se le cuenta.
+const projectiles = {};
+
+const PROJECTILE_TICK_MS = 50;  // La trayectoria se revisa 20 veces por segundo
+const PROJECTILE_RADIUS = 20;   // Radio de colisión del proyectil
+
+// Tamaño del mapa. Debe coincidir con el lienzo del cliente (800x600)
+const WORLD_WIDTH = 800;
+const WORLD_HEIGHT = 600;
+
+// Regeneración pasiva: fuera de combate la vida y el maná vuelven solos
+const REGEN_INTERVAL_MS = 3000;
+const REGEN_HP_RATIO = 0.03;
+const REGEN_MP_RATIO = 0.05;
+
+// Derribo: todavía no hay sistema de muerte, así que caer a cero devuelve al
+// personaje al centro del mapa con la vida y el maná al máximo.
+const RESPAWN_X = 400;
+const RESPAWN_Y = 320;
+
 // Guarda experiencia, oro, nivel y puntos de estadística del personaje en PostgreSQL
 async function persistCharacterProgress(player) {
   if (!player.characterId) return;
@@ -360,6 +431,387 @@ function spawnDrop(monster) {
   };
 
   io.emit('itemDropped', publicDrop(worldDrops[dropId]));
+}
+
+// --- Combate por clases (Módulo G) -------------------------------------------
+
+// La habilidad de la clase, o null si esa clase no tiene ninguna
+function skillForClass(characterClass) {
+  return SKILLS[characterClass] || null;
+}
+
+// Lo que el cliente necesita saber de su habilidad para ofrecerla en el HUD
+function publicSkill(skill) {
+  return {
+    id: skill.id,
+    name: skill.name,
+    kind: skill.kind,
+    mpCost: skill.mpCost,
+    cooldownMs: skill.cooldownMs
+  };
+}
+
+function skillDenied(socket, text) {
+  socket.emit('skillDenied', { text });
+}
+
+// Daño de una habilidad, redondeado y nunca por debajo de 1: un atributo bajo no
+// debe convertir la habilidad en un gesto inútil
+function skillDamage(player, skill, critical) {
+  const base = Math.max(1, Math.round(skill.damage(player)));
+
+  return critical ? Math.round(base * (skill.critMultiplier || 1)) : base;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+// Ángulo normalizado a (-PI, PI], para comparar direcciones sin dar vueltas
+function normalizeAngle(angle) {
+  const turn = Math.PI * 2;
+
+  return ((angle + Math.PI) % turn + turn) % turn - Math.PI;
+}
+
+// Aplica daño a un monstruo: barra, muerte, recompensas y reaparición. Devuelve
+// true si el golpe lo tumbó.
+function damageMonster(monster, damage, player, options = {}) {
+  if (!monster || !monster.alive) return false;
+
+  monster.hp = Math.max(0, monster.hp - damage);
+  markInCombat(player);
+
+  io.emit('monsterDamaged', {
+    monsterId: monster.id,
+    damage,
+    currentHp: monster.hp,
+    maxHp: monster.maxHp,
+    critical: Boolean(options.critical),
+    skillId: options.skillId || null
+  });
+
+  if (monster.hp > 0) return false;
+
+  monster.alive = false;
+  io.emit('monsterKilled', {
+    monsterId: monster.id,
+    killedBy: player ? player.name : 'un golpe perdido'
+  });
+
+  // Sin dueño (se desconectó a mitad de vuelo) no hay recompensas que dar
+  if (player) grantCombatRewards(player, monster);
+
+  spawnDrop(monster);
+
+  setTimeout(() => {
+    monster.hp = monster.maxHp;
+    monster.alive = true;
+    io.emit('monsterRespawned', monster);
+  }, 5000); // Reaparece a los 5 segundos
+
+  return true;
+}
+
+// Guarda vida, maná y posición. El derribo no pasa por el cierre de sesión, que
+// es quien escribe normalmente estas columnas.
+async function persistVitals(player) {
+  if (!player.characterId) return;
+
+  try {
+    await db.query(
+      `UPDATE characters
+          SET hp_current = $2, mp_current = $3, pos_x = $4, pos_y = $5
+        WHERE id = $1`,
+      [
+        player.characterId,
+        Math.round(player.hpCurrent),
+        Math.round(player.mpCurrent),
+        Math.round(player.x),
+        Math.round(player.y)
+      ]
+    );
+  } catch (error) {
+    console.error(`⚠️ No se pudo guardar la vida de ${player.name}:`, error.message);
+  }
+}
+
+// Aplica daño a otro jugador. No hay equipos todavía: cualquier otro jugador es
+// un objetivo válido, así que el PvP es de todos contra todos.
+function damagePlayer(target, damage, attacker, options = {}) {
+  if (!target) return false;
+
+  target.hpCurrent = Math.max(0, target.hpCurrent - damage);
+  markInCombat(target);
+
+  io.emit('playerDamaged', {
+    playerId: target.playerId,
+    characterId: target.characterId,
+    damage,
+    hpCurrent: target.hpCurrent,
+    hpMax: target.hpMax,
+    attackerId: attacker ? attacker.playerId : null,
+    skillId: options.skillId || null
+  });
+
+  const targetSocket = io.sockets.sockets.get(target.playerId);
+  if (targetSocket) emitStats(targetSocket);
+
+  if (target.hpCurrent > 0) return false;
+
+  // Derribado: vuelve al centro del mapa con la vida y el maná enteros
+  target.hpCurrent = target.hpMax;
+  target.mpCurrent = target.mpMax;
+  target.x = RESPAWN_X;
+  target.y = RESPAWN_Y;
+
+  io.emit('playerRespawned', {
+    playerId: target.playerId,
+    characterId: target.characterId,
+    x: target.x,
+    y: target.y,
+    hpCurrent: target.hpCurrent,
+    hpMax: target.hpMax,
+    mpCurrent: target.mpCurrent,
+    mpMax: target.mpMax
+  });
+
+  if (targetSocket) {
+    emitStats(targetSocket);
+    notify(targetSocket, 'Te han derribado: vuelves al centro del mapa.', '#ff5252');
+  }
+
+  persistVitals(target);
+
+  return true;
+}
+
+// Crea un proyectil hacia el punto apuntado. La dirección se normaliza aquí: la
+// trayectoria no depende de lo que el cliente cuente después.
+function spawnProjectile(player, skill, targetX, targetY) {
+  const dx = targetX - player.x;
+  const dy = targetY - player.y;
+  const distance = Math.hypot(dx, dy);
+
+  // Apuntarse a los pies no tiene dirección: no se lanza nada
+  if (distance < 1) return null;
+
+  const id = randomUUID();
+
+  projectiles[id] = {
+    id,
+    skillId: skill.id,
+    kind: skill.projectile,
+    ownerId: player.playerId,
+    damage: skillDamage(player, skill, false),
+    x: player.x,
+    y: player.y,
+    dirX: dx / distance,
+    dirY: dy / distance,
+    speed: skill.speed,
+    // Vuela hasta donde apuntó el jugador, sin pasar del alcance de la habilidad
+    remaining: Math.min(distance, skill.range)
+  };
+
+  io.emit('projectileSpawned', {
+    id,
+    skillId: skill.id,
+    kind: skill.projectile,
+    ownerId: player.playerId,
+    x: player.x,
+    y: player.y,
+    dirX: projectiles[id].dirX,
+    dirY: projectiles[id].dirY,
+    speed: skill.speed,
+    remaining: projectiles[id].remaining
+  });
+
+  return projectiles[id];
+}
+
+// Primer monstruo vivo dentro del radio de colisión del proyectil
+function projectileMonsterHit(projectile) {
+  return Object.values(monsters).find((monster) => (
+    monster.alive
+      && Math.hypot(projectile.x - monster.x, projectile.y - monster.y) <= PROJECTILE_RADIUS
+  )) || null;
+}
+
+// Primer jugador dentro del radio que no sea el dueño del proyectil
+function projectilePlayerHit(projectile) {
+  return Object.values(players).find((player) => (
+    player.playerId !== projectile.ownerId
+      && Math.hypot(projectile.x - player.x, projectile.y - player.y) <= PROJECTILE_RADIUS
+  )) || null;
+}
+
+// Avanza todos los proyectiles vivos y resuelve sus impactos
+function tickProjectiles() {
+  const seconds = PROJECTILE_TICK_MS / 1000;
+
+  Object.keys(projectiles).forEach((id) => {
+    const projectile = projectiles[id];
+    if (!projectile) return;
+
+    const step = Math.min(projectile.speed * seconds, projectile.remaining);
+    projectile.x += projectile.dirX * step;
+    projectile.y += projectile.dirY * step;
+    projectile.remaining -= step;
+
+    const monster = projectileMonsterHit(projectile);
+    const target = monster || projectilePlayerHit(projectile);
+
+    if (target) {
+      delete projectiles[id];
+
+      // El dueño puede haberse ido mientras el proyectil volaba
+      const owner = players[projectile.ownerId] || null;
+
+      if (monster) {
+        damageMonster(monster, projectile.damage, owner, { skillId: projectile.skillId });
+      } else {
+        damagePlayer(target, projectile.damage, owner, { skillId: projectile.skillId });
+      }
+
+      io.emit('projectileHit', {
+        id,
+        kind: projectile.kind,
+        x: projectile.x,
+        y: projectile.y,
+        hit: true,
+        damage: projectile.damage,
+        targetId: monster ? monster.id : target.playerId,
+        targetType: monster ? 'monster' : 'player'
+      });
+      return;
+    }
+
+    // Se acabó el recorrido sin tocar nada
+    if (projectile.remaining <= 0) {
+      delete projectiles[id];
+
+      io.emit('projectileHit', {
+        id,
+        kind: projectile.kind,
+        x: projectile.x,
+        y: projectile.y,
+        hit: false,
+        damage: 0,
+        targetId: null,
+        targetType: null
+      });
+      return;
+    }
+
+    io.emit('projectileMoved', { id, x: projectile.x, y: projectile.y });
+  });
+}
+
+// Corte Vorpal: barrido en abanico hacia donde se apunta, con crítico posible
+function castArc(player, skill, targetX, targetY) {
+  const aim = Math.atan2(targetY - player.y, targetX - player.x);
+  const hits = [];
+
+  Object.values(monsters).forEach((monster) => {
+    if (!monster.alive) return;
+
+    const distance = Math.hypot(monster.x - player.x, monster.y - player.y);
+    if (distance > skill.range) return;
+
+    // Fuera del abanico apuntado no lo alcanza, aunque esté cerca
+    const angle = Math.atan2(monster.y - player.y, monster.x - player.x);
+    if (Math.abs(normalizeAngle(angle - aim)) > skill.arcHalfAngle) return;
+
+    const critical = Math.random() < skill.critChance;
+    hits.push({ monster, damage: skillDamage(player, skill, critical), critical });
+  });
+
+  io.emit('skillArc', {
+    playerId: player.playerId,
+    skillId: skill.id,
+    x: player.x,
+    y: player.y,
+    angle: aim,
+    range: skill.range
+  });
+
+  hits.forEach((entry) => {
+    damageMonster(entry.monster, entry.damage, player, {
+      critical: entry.critical,
+      skillId: skill.id
+    });
+  });
+}
+
+// Primer monstruo vivo al alcance: el apuntado si sigue cerca, si no el más próximo
+function meleeTarget(player, range, targetEntityId) {
+  const close = Object.values(monsters).filter((monster) => (
+    monster.alive && Math.hypot(monster.x - player.x, monster.y - player.y) <= range
+  ));
+
+  if (targetEntityId) {
+    const aimed = close.find((monster) => monster.id === targetEntityId);
+    if (aimed) return aimed;
+  }
+
+  return close.sort((a, b) => (
+    Math.hypot(a.x - player.x, a.y - player.y) - Math.hypot(b.x - player.x, b.y - player.y)
+  ))[0] || null;
+}
+
+// Ataque Sombrío: salto corto hacia el cursor y golpe garantizado
+function castBlink(player, skill, targetX, targetY, targetEntityId) {
+  const dx = targetX - player.x;
+  const dy = targetY - player.y;
+  const distance = Math.hypot(dx, dy) || 1;
+  const jump = Math.min(distance, skill.blinkDistance);
+
+  const fromX = player.x;
+  const fromY = player.y;
+
+  player.x = clamp(player.x + (dx / distance) * jump, 0, WORLD_WIDTH);
+  player.y = clamp(player.y + (dy / distance) * jump, 0, WORLD_HEIGHT);
+
+  io.emit('skillBlink', {
+    playerId: player.playerId,
+    skillId: skill.id,
+    fromX,
+    fromY,
+    x: player.x,
+    y: player.y
+  });
+
+  const target = meleeTarget(player, skill.hitRange, targetEntityId);
+  if (target) {
+    damageMonster(target, skillDamage(player, skill, false), player, { skillId: skill.id });
+  }
+}
+
+// Vida y maná vuelven poco a poco cuando el jugador lleva un rato sin pelear
+function regeneratePlayers() {
+  const now = Date.now();
+
+  Object.values(players).forEach((player) => {
+    // "En combate" es la misma ventana que bloquea el cierre de sesión
+    if (now - player.lastCombatTime < COMBAT_LOGOUT_BLOCK_MS) return;
+
+    const hpGain = Math.max(0, Math.min(
+      player.hpMax - player.hpCurrent,
+      Math.round(player.hpMax * REGEN_HP_RATIO)
+    ));
+    const mpGain = Math.max(0, Math.min(
+      player.mpMax - player.mpCurrent,
+      Math.round(player.mpMax * REGEN_MP_RATIO)
+    ));
+
+    if (hpGain <= 0 && mpGain <= 0) return;
+
+    player.hpCurrent += hpGain;
+    player.mpCurrent += mpGain;
+
+    const socket = io.sockets.sockets.get(player.playerId);
+    if (socket) emitStats(socket);
+  });
 }
 
 // --- Inventario -------------------------------------------------------------
@@ -584,7 +1036,8 @@ io.on('connection', (socket) => {
     x: Number.isFinite(spawnX) ? spawnX : 400,
     y: Number.isFinite(spawnY) ? spawnY : 320,
     lastCombatTime: 0,   // 0 = nunca ha combatido en esta sesión
-    pendingLogout: null  // cuenta regresiva de cierre de sesión en curso
+    pendingLogout: null, // cuenta regresiva de cierre de sesión en curso
+    skillReadyAt: 0      // momento (ms) en que la habilidad vuelve a estar lista
   };
 
   // Enviar estado inicial al jugador entrante. Los jugadores viajan proyectados:
@@ -603,6 +1056,17 @@ io.on('connection', (socket) => {
   // Inventario y estadísticas del personaje
   emitInventory(socket, 'currentInventory');
   emitStats(socket);
+
+  // Qué habilidad tiene esta clase y cuánto cuesta lanzarla
+  const classSkill = skillForClass(players[socket.id].characterClass);
+  if (classSkill) {
+    socket.emit('skillInfo', publicSkill(classSkill));
+    notify(
+      socket,
+      `${classSkill.name}: cuesta ${classSkill.mpCost} de maná y se lanza con el clic derecho.`,
+      '#7fd4ff'
+    );
+  }
 
   // Movimiento
   socket.on('playerMovement', (movementData) => {
@@ -628,41 +1092,74 @@ io.on('connection', (socket) => {
     // Buscar monstruos vivos dentro del rango de ataque melee (60px)
     Object.values(monsters).forEach((m) => {
       if (!m.alive) return;
+      if (Math.hypot(player.x - m.x, player.y - m.y) > 60) return;
 
-      const dist = Math.hypot(player.x - m.x, player.y - m.y);
-      if (dist <= 60) {
-        // Golpear a alguien es lo que cuenta como estar en combate
-        markInCombat(player);
-
-        const damage = Math.floor(Math.random() * 15) + 10; // Daño entre 10 y 25
-        m.hp = Math.max(0, m.hp - damage);
-
-        io.emit('monsterDamaged', {
-          monsterId: m.id,
-          damage,
-          currentHp: m.hp,
-          maxHp: m.maxHp
-        });
-
-        // Muerte y Respawn
-        if (m.hp <= 0) {
-          m.alive = false;
-          io.emit('monsterKilled', { monsterId: m.id, killedBy: player.name });
-
-          // Recompensas de combate (XP + Oro) para el jugador atacante
-          grantCombatRewards(player, m);
-
-          // Tirada de botín en el suelo
-          spawnDrop(m);
-
-          setTimeout(() => {
-            m.hp = m.maxHp;
-            m.alive = true;
-            io.emit('monsterRespawned', m);
-          }, 5000); // Reaparece a los 5 segundos
-        }
-      }
+      // Daño entre 10 y 25. El golpe básico no depende del atributo: el daño por
+      // atributo es lo que distingue a las habilidades de cada clase.
+      damageMonster(m, Math.floor(Math.random() * 15) + 10, player);
     });
+  });
+
+  // Habilidad de clase (Módulo G). El servidor valida recarga, maná y dirección
+  // antes de gastar un solo punto: el cliente solo apunta.
+  socket.on('castSkill', (payload) => {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const skill = skillForClass(player.characterClass);
+    if (!skill) {
+      skillDenied(socket, 'Tu clase no tiene habilidades.');
+      return;
+    }
+
+    // Si el cliente nombra una habilidad, tiene que ser la suya
+    const requested = payload && payload.skillId;
+    if (requested && requested !== skill.id) return;
+
+    const targetX = Number(payload && payload.targetX);
+    const targetY = Number(payload && payload.targetY);
+    if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) return;
+
+    // Lanzar una habilidad cancela un cierre de sesión en curso
+    cancelPendingLogout(player);
+
+    const now = Date.now();
+    if (player.skillReadyAt > now) {
+      const pending = ((player.skillReadyAt - now) / 1000).toFixed(1);
+      skillDenied(socket, `${skill.name} se está recargando (${pending}s).`);
+      return;
+    }
+
+    if (player.mpCurrent < skill.mpCost) {
+      skillDenied(socket, `Te falta maná: ${skill.name} cuesta ${skill.mpCost}.`);
+      return;
+    }
+
+    // El apuntado se acota al mapa: el cliente no decide hasta dónde llega
+    const aimX = clamp(targetX, 0, WORLD_WIDTH);
+    const aimY = clamp(targetY, 0, WORLD_HEIGHT);
+
+    // Apuntarse a los pies no gasta maná ni arranca la recarga
+    if (skill.kind === 'projectile' && Math.hypot(aimX - player.x, aimY - player.y) < 1) {
+      skillDenied(socket, 'Apunta a algún sitio para lanzar el proyectil.');
+      return;
+    }
+
+    player.mpCurrent -= skill.mpCost;
+    player.skillReadyAt = now + skill.cooldownMs;
+
+    // Lanzar la habilidad es pelear: cuenta para el cierre de sesión y para la
+    // regeneración igual que un golpe
+    markInCombat(player);
+    emitStats(socket);
+
+    if (skill.kind === 'projectile') {
+      spawnProjectile(player, skill, aimX, aimY);
+    } else if (skill.kind === 'arc') {
+      castArc(player, skill, aimX, aimY);
+    } else {
+      castBlink(player, skill, aimX, aimY, payload && payload.targetEntityId);
+    }
   });
 
   // Recoger un ítem del suelo (tecla G en el cliente)
@@ -1240,5 +1737,10 @@ ensureItemTemplates()
   .finally(() => {
     server.listen(PORT, () => {
       console.log(`🚀 Servidor Elysia Online activo en http://localhost:${PORT}`);
+
+      // El servidor simula proyectiles y regenera vida y maná con sus propios
+      // relojes: no depende de que nadie pulse nada.
+      setInterval(tickProjectiles, PROJECTILE_TICK_MS);
+      setInterval(regeneratePlayers, REGEN_INTERVAL_MS);
     });
   });
