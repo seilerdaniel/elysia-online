@@ -12,6 +12,22 @@ const PICKUP_RANGE = 40;
 // Debe coincidir con SHOP_RANGE del servidor
 const SHOP_RANGE = 50;
 
+// --- Bando y clan (Módulo H) --------------------------------------------------
+// El color del nombre cuenta el bando: azul ciudadano, rojo renegado, gris
+// neutral y dorado para un héroe de karma alto.
+const FACTION_COLORS = {
+  Ciudadano: '#4fc3f7',
+  Renegado: '#ff5252',
+  Neutral: '#b0bec5'
+};
+
+const HERO_COLOR = '#ffd700';
+const CLAN_LABEL_COLOR = '#ffd700';
+
+// Altura del nombre sobre la cabeza y hueco que se le hace a la etiqueta de clan
+const LABEL_BASE_Y = 25;
+const CLAN_LABEL_GAP = 13;
+
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super('GameScene');
@@ -31,6 +47,7 @@ export default class GameScene extends Phaser.Scene {
     this.projectiles = null;
     this.skillInfo = null;
     this.localBars = null;
+    this.localLabelOffset = 0;
     this.speed = 160;
     this.isChatting = false;
     this.activeCharacter = null;
@@ -148,9 +165,8 @@ export default class GameScene extends Phaser.Scene {
       this.otherPlayers.getChildren().forEach((otherPlayer) => {
         if (playerInfo.playerId === otherPlayer.playerId) {
           otherPlayer.setPosition(playerInfo.x, playerInfo.y);
-          if (otherPlayer.nameText) {
-            otherPlayer.nameText.setPosition(playerInfo.x, playerInfo.y - 25);
-          }
+          this.placeOverheadLabels(otherPlayer);
+
           if (otherPlayer.speechBubble) {
             otherPlayer.speechBubble.setPosition(playerInfo.x, playerInfo.y - 42);
           }
@@ -162,10 +178,29 @@ export default class GameScene extends Phaser.Scene {
       this.otherPlayers.getChildren().forEach((op) => {
         if (playerId === op.playerId) {
           if (op.nameText) op.nameText.destroy();
+          if (op.clanText) op.clanText.destroy();
           if (op.speechBubble) op.speechBubble.destroy();
           op.destroy();
         }
       });
+    });
+
+    // Bando y karma (Módulo H): el nombre cambia de color al instante
+    this.socket.on('playerFactionUpdated', (data) => {
+      const target = this.findPlayerByCharacterId(data.characterId);
+      if (!target || !target.nameText) return;
+
+      target.faction = data.faction;
+      target.hero = Boolean(data.hero);
+      target.nameText.setColor(this.factionColor(data));
+    });
+
+    // Etiqueta de clan (Módulo H): aparece, cambia de nombre o desaparece
+    this.socket.on('playerClanUpdated', (data) => {
+      const target = this.findPlayerByCharacterId(data.characterId);
+      if (!target) return;
+
+      this.setClanLabel(target, data, target === this.player);
     });
 
     // Subida de nivel: actualiza la etiqueta, muestra texto flotante y destello
@@ -542,19 +577,26 @@ export default class GameScene extends Phaser.Scene {
     this.player.characterId = playerInfo.characterId;
     this.player.playerName = playerInfo.name;
     this.player.baseTint = 0xffffff;
+    this.player.faction = playerInfo.faction;
+    this.player.hero = Boolean(playerInfo.hero);
+    this.player.clanName = playerInfo.clanName || null;
+
+    this.localLabelOffset = this.labelOffset(this.player);
 
     this.player.nameText = this.add.text(
       playerInfo.x,
-      playerInfo.y - 25,
+      playerInfo.y - LABEL_BASE_Y - this.localLabelOffset,
       `${playerInfo.name} [Niv.${playerInfo.level}]`,
       {
         fontSize: '12px',
-        fill: '#ffff00',
+        fill: this.factionColor(playerInfo),
         fontStyle: 'bold',
         stroke: '#000000',
         strokeThickness: 3
       }
     ).setOrigin(0.5);
+
+    this.setClanLabel(this.player, playerInfo, true);
 
     // Barras de vida y maná sobre la cabeza (Módulo G)
     this.buildLocalBars();
@@ -568,21 +610,83 @@ export default class GameScene extends Phaser.Scene {
     otherPlayer.characterId = playerInfo.characterId;
     otherPlayer.playerName = playerInfo.name;
     otherPlayer.baseTint = 0x808080;
+    otherPlayer.faction = playerInfo.faction;
+    otherPlayer.hero = Boolean(playerInfo.hero);
+    otherPlayer.clanName = playerInfo.clanName || null;
 
     otherPlayer.nameText = this.add.text(
       playerInfo.x,
-      playerInfo.y - 25,
+      playerInfo.y - LABEL_BASE_Y - this.labelOffset(otherPlayer),
       `${playerInfo.name} [Niv.${playerInfo.level}]`,
       {
         fontSize: '12px',
-        fill: '#ffffff',
+        fill: this.factionColor(playerInfo),
         fontStyle: 'bold',
         stroke: '#000000',
         strokeThickness: 3
       }
     ).setOrigin(0.5);
 
+    this.setClanLabel(otherPlayer, playerInfo);
+
     this.otherPlayers.add(otherPlayer);
+  }
+
+  // --- Bando y clan sobre la cabeza (Módulo H) --------------------------------
+
+  // Azul ciudadano, rojo renegado, gris neutral y dorado para los héroes
+  factionColor(playerInfo) {
+    if (playerInfo.hero) return HERO_COLOR;
+
+    return FACTION_COLORS[playerInfo.faction] || FACTION_COLORS.Neutral;
+  }
+
+  // El nombre sube cuando el personaje tiene clan, para dejarle sitio debajo
+  labelOffset(target) {
+    return target && target.clanName ? CLAN_LABEL_GAP : 0;
+  }
+
+  // Coloca encima del personaje el nombre y, si la hay, la etiqueta de clan
+  placeOverheadLabels(target) {
+    const nameY = target.y - LABEL_BASE_Y - this.labelOffset(target);
+
+    if (target.nameText) target.nameText.setPosition(target.x, nameY);
+    if (target.clanText) target.clanText.setPosition(target.x, nameY + CLAN_LABEL_GAP);
+  }
+
+  // Etiqueta del clan en dorado debajo del nombre. Sin clan, desaparece y el
+  // nombre vuelve a su altura de siempre.
+  setClanLabel(target, playerInfo, isLocal = false) {
+    target.clanName = playerInfo.clanName || null;
+
+    if (isLocal) {
+      // Las barras de vida y maná suben con el nombre para no pisarlo
+      this.localLabelOffset = this.labelOffset(target);
+      this.updateLocalBars();
+    }
+
+    if (!target.clanName) {
+      if (target.clanText) {
+        target.clanText.destroy();
+        target.clanText = null;
+      }
+
+      this.placeOverheadLabels(target);
+      return;
+    }
+
+    if (!target.clanText) {
+      target.clanText = this.add.text(0, 0, '', {
+        fontSize: '10px',
+        fill: CLAN_LABEL_COLOR,
+        fontStyle: 'bold',
+        stroke: '#000000',
+        strokeThickness: 2
+      }).setOrigin(0.5);
+    }
+
+    target.clanText.setText(`[${target.clanName}]`);
+    this.placeOverheadLabels(target);
   }
 
   addMonster(m) {
@@ -662,10 +766,13 @@ export default class GameScene extends Phaser.Scene {
     const { hpCurrent, hpMax, mpCurrent, mpMax } = this.playerStats;
     const { x, y } = this.player;
 
-    hpBg.setPosition(x, y - 40);
-    hpBar.setPosition(x - 16, y - 40);
-    mpBg.setPosition(x, y - 34);
-    mpBar.setPosition(x - 16, y - 34);
+    // Con etiqueta de clan el nombre sube: las barras suben con él
+    const lift = this.localLabelOffset;
+
+    hpBg.setPosition(x, y - 40 - lift);
+    hpBar.setPosition(x - 16, y - 40 - lift);
+    mpBg.setPosition(x, y - 34 - lift);
+    mpBar.setPosition(x - 16, y - 34 - lift);
 
     const hpPct = hpMax > 0 ? Phaser.Math.Clamp(hpCurrent / hpMax, 0, 1) : 0;
     const mpPct = mpMax > 0 ? Phaser.Math.Clamp(mpCurrent / mpMax, 0, 1) : 0;
@@ -673,7 +780,6 @@ export default class GameScene extends Phaser.Scene {
     hpBar.width = 32 * hpPct;
     mpBar.width = 32 * mpPct;
   }
-
   // Lanza la habilidad de la clase apuntando al cursor. El servidor decide si se
   // puede lanzar (maná, recarga, distancia): aquí solo se manda el punto.
   castSkill(pointer) {
@@ -844,6 +950,7 @@ export default class GameScene extends Phaser.Scene {
     if (!target) return;
 
     target.setPosition(data.x, data.y);
+    this.placeOverheadLabels(target);
 
     // Solo el derribo trae vida y maná nuevos
     if (target === this.player && data.hpCurrent !== undefined) {
@@ -1131,7 +1238,7 @@ export default class GameScene extends Phaser.Scene {
     }
 
     this.player.body.velocity.normalize().scale(this.speed);
-    this.player.nameText.setPosition(this.player.x, this.player.y - 25);
+    this.placeOverheadLabels(this.player);
 
     if (this.player.speechBubble) {
       this.player.speechBubble.setPosition(this.player.x, this.player.y - 42);
