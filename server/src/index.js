@@ -97,12 +97,14 @@ function playersSnapshot(mapId) {
   return snapshot;
 }
 
-// Proyección pública de una zona: nombre, tamaño, punto de aparición y puertas
+// Proyección pública de una zona: nombre, tamaño, punto de aparición y puertas.
+// La zona se identifica siempre como mapId, también en mapChangeSuccess, para que
+// el cliente no tenga que leer dos nombres distintos del mismo dato.
 function publicMap(mapId) {
   const map = mapById(mapId);
 
   return {
-    id: map.id,
+    mapId: map.id,
     name: map.name,
     width: MAP_SIZE,
     height: MAP_SIZE,
