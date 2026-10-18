@@ -100,6 +100,17 @@ EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
+-- Invitaciones de clan pendientes (Módulo H). Viven en su propia tabla para que
+-- sobrevivan a un reinicio del servidor: el invitado puede aceptar más tarde.
+CREATE TABLE IF NOT EXISTS clan_invites (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    clan_id UUID NOT NULL REFERENCES clans(id) ON DELETE CASCADE,
+    character_id UUID NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    invited_by UUID REFERENCES characters(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (clan_id, character_id)
+);
+
 -- -----------------------------------------------------------------------------
 -- 4. PLANTILLAS E INVENTARIO DE ÍTEMS (+1 a +15 Estilo MU Online)
 -- -----------------------------------------------------------------------------
@@ -153,3 +164,4 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_characters_user ON characters(user_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_character ON inventory_items(character_id);
 CREATE INDEX IF NOT EXISTS idx_characters_clan ON characters(clan_id);
+CREATE INDEX IF NOT EXISTS idx_clan_invites_character ON clan_invites(character_id);

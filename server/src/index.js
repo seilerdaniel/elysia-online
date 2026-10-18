@@ -22,6 +22,7 @@ const jwt = require('jsonwebtoken');
 
 const authRoutes = require('./routes/authRoutes');
 const characterRoutes = require('./routes/characterRoutes');
+const clanController = require('./controllers/clanController');
 const db = require('./config/db');
 
 const app = express();
@@ -931,13 +932,16 @@ function karmaForDown(victim) {
 }
 
 // Estado del personaje que decide el servidor. El cliente elige la ficha, pero no
-// su karma ni su bando: eso lo manda la base de datos.
+// su karma, su bando ni su clan: eso lo manda la base de datos.
 async function loadCharacterState(characterId) {
   if (!characterId) return null;
 
   try {
     const result = await db.query(
-      'SELECT karma, faction FROM characters WHERE id = $1',
+      `SELECT c.karma, c.faction, c.clan_id, c.clan_rank, cl.name AS clan_name
+         FROM characters c
+         LEFT JOIN clans cl ON cl.id = c.clan_id
+        WHERE c.id = $1`,
       [characterId]
     );
 
@@ -946,6 +950,64 @@ async function loadCharacterState(characterId) {
     console.error('⚠️ No se pudo leer el estado del personaje:', error.message);
     return null;
   }
+}
+
+// --- Clanes (Módulo H) -------------------------------------------------------
+
+// Avisa a todo el mundo de que la etiqueta de clan de un jugador cambió: el mapa
+// la borra o la repinta al instante
+function broadcastPlayerClan(player) {
+  io.emit('playerClanUpdated', {
+    playerId: player.playerId,
+    characterId: player.characterId,
+    clanName: player.clanName || null,
+    clanRank: player.clanRank || null
+  });
+}
+
+// Ficha del clan de un jugador, marcando quién está en línea ahora mismo
+async function clanStateFor(player) {
+  const state = await clanController.getClanState({
+    clanId: player.clanId,
+    characterId: player.characterId
+  });
+
+  if (!state.clan) return { clan: null, members: [] };
+
+  const online = new Set(Object.values(players).map((p) => p.characterId));
+
+  return {
+    clan: state.clan,
+    members: state.members.map((member) => ({ ...member, online: online.has(member.characterId) }))
+  };
+}
+
+// Deja el registro en memoria a tono con la base de datos y avisa a los clientes
+async function syncPlayerClan(player) {
+  const stored = await loadCharacterState(player.characterId);
+
+  player.clanId = (stored && stored.clan_id) || null;
+  player.clanName = (stored && stored.clan_name) || null;
+  player.clanRank = (stored && stored.clan_rank) || null;
+
+  broadcastPlayerClan(player);
+
+  const socket = io.sockets.sockets.get(player.playerId);
+  if (socket) socket.emit('clanInfo', await clanStateFor(player));
+}
+
+// Refresca la ventana de clan de todos los miembros conectados
+async function refreshClanMembers(clanId) {
+  if (!clanId) return;
+
+  const connected = Object.values(players).filter((p) => p.clanId === clanId);
+
+  await Promise.all(connected.map(async (member) => {
+    const socket = io.sockets.sockets.get(member.playerId);
+    if (!socket) return;
+
+    socket.emit('clanInfo', await clanStateFor(member));
+  }));
 }
 
 // --- Inventario -------------------------------------------------------------
@@ -1049,6 +1111,8 @@ function publicPlayer(player) {
     faction: player.faction,
     karma: player.karma,
     hero: isHero(player),
+    clanName: player.clanName || null,
+    clanRank: player.clanRank || null,
     x: player.x,
     y: player.y
   };
@@ -1180,6 +1244,9 @@ io.on('connection', async (socket) => {
     y: Number.isFinite(spawnY) ? spawnY : 320,
     karma: stored ? Number(stored.karma) || 0 : 0,
     faction: (stored && stored.faction) || 'Neutral',
+    clanId: (stored && stored.clan_id) || null,
+    clanName: (stored && stored.clan_name) || null,
+    clanRank: (stored && stored.clan_rank) || null,
     lastCombatTime: 0,   // 0 = nunca ha combatido en esta sesión
     pendingLogout: null, // cuenta regresiva de cierre de sesión en curso
     skillReadyAt: 0      // momento (ms) en que la habilidad vuelve a estar lista
@@ -1201,6 +1268,18 @@ io.on('connection', async (socket) => {
   // Inventario y estadísticas del personaje
   emitInventory(socket, 'currentInventory');
   emitStats(socket);
+
+  // Clanes (Módulo H): la ficha del clan y las invitaciones que quedaron pendientes
+  socket.emit('clanInfo', await clanStateFor(players[socket.id]));
+
+  const invited = await clanController.pendingInvites(players[socket.id].characterId);
+  invited.forEach((invite) => {
+    socket.emit('clanInviteReceived', {
+      clanId: invite.clanId,
+      clanName: invite.clanName,
+      from: null
+    });
+  });
 
   // Qué habilidad tiene esta clase y cuánto cuesta lanzarla
   const classSkill = skillForClass(players[socket.id].characterClass);
@@ -1808,21 +1887,184 @@ io.on('connection', async (socket) => {
     emitStats(socket);
   });
 
+  // --- Clanes (Módulo H) ---
+  // La ventana de clan (tecla K) y los comandos de chat piden lo mismo: aquí vive
+  // una sola versión de cada acción y los dos caminos la comparten.
+
+  async function handleCreateClan(rawName) {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const result = await clanController.createClan({
+      characterId: player.characterId,
+      name: rawName
+    });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    // La fundación se cobra en la base de datos: el oro en memoria baja igual
+    player.gold = Math.max(0, player.gold - result.cost);
+
+    await syncPlayerClan(player);
+    emitStats(socket);
+    notify(socket, `Has fundado el clan ${result.clan.name} <${result.clan.tag}>.`, '#ffd700');
+  }
+
+  async function handleInvite(rawName) {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const result = await clanController.inviteToClan({
+      characterId: player.characterId,
+      targetName: rawName
+    });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    notify(socket, `Has invitado a ${result.targetName} al clan ${result.clanName}.`, '#ffd700');
+
+    // Si el invitado está conectado se le avisa en el momento; si no, la invitación
+    // le espera en la base de datos
+    const guest = Object.values(players).find((p) => p.characterId === result.targetId);
+    const guestSocket = guest && io.sockets.sockets.get(guest.playerId);
+
+    if (guestSocket) {
+      guestSocket.emit('clanInviteReceived', { clanName: result.clanName, from: player.name });
+      notify(guestSocket, `${player.name} te invita al clan ${result.clanName}. Acepta con /aceptarclan.`, '#ffd700');
+    }
+  }
+
+  async function handleAcceptInvite(clanId) {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const result = await clanController.acceptInvite({
+      characterId: player.characterId,
+      clanId: clanId || null
+    });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    await syncPlayerClan(player);
+    notify(socket, `Te has unido al clan ${result.clanName}.`, '#ffd700');
+
+    // El resto del clan ve al nuevo miembro
+    await refreshClanMembers(player.clanId);
+  }
+
+  async function handleLeaveClan() {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const previousClanId = player.clanId;
+    const result = await clanController.leaveClan({ characterId: player.characterId });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    await syncPlayerClan(player);
+    notify(socket, 'Has abandonado el clan.', '#ffd700');
+    await refreshClanMembers(previousClanId);
+  }
+
+  async function handleKick(rawName) {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const result = await clanController.kickFromClan({
+      characterId: player.characterId,
+      targetName: rawName
+    });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    notify(socket, `${result.targetName} ya no está en el clan.`, '#ffd700');
+
+    const kicked = Object.values(players).find((p) => p.characterId === result.targetId);
+
+    if (kicked) {
+      await syncPlayerClan(kicked);
+      notifyPlayer(kicked, 'Te han expulsado del clan.', '#ff5252');
+    }
+
+    await refreshClanMembers(result.clanId);
+  }
+
+  async function handleDissolveClan() {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const result = await clanController.dissolveClan({ characterId: player.characterId });
+
+    if (!result.ok) {
+      notify(socket, result.text, '#ff8a80');
+      return;
+    }
+
+    // Todos los miembros en línea pierden la etiqueta a la vez
+    const members = Object.values(players).filter((p) => p.clanId === result.clanId);
+
+    await Promise.all(members.map(async (member) => {
+      await syncPlayerClan(member);
+      notifyPlayer(member, `El clan ${result.clanName} ha sido disuelto.`, '#ff8a80');
+    }));
+  }
+
+  socket.on('createClan', (payload) => handleCreateClan(payload && (payload.clanName || payload.name)));
+  socket.on('inviteToClan', (payload) => handleInvite(payload && (payload.playerName || payload.targetName)));
+  socket.on('acceptClanInvite', (payload) => handleAcceptInvite(payload && payload.clanId));
+  socket.on('leaveClan', () => handleLeaveClan());
+  socket.on('kickFromClan', (payload) => handleKick(payload && (payload.playerName || payload.targetName)));
+  socket.on('dissolveClan', () => handleDissolveClan());
+
+  // La ventana de clan pide la ficha cada vez que se abre
+  socket.on('requestClan', async () => {
+    const player = players[socket.id];
+    if (!player) return;
+
+    socket.emit('clanInfo', await clanStateFor(player));
+  });
+
   // Chat y Comandos
-  socket.on('sendChatMessage', (message) => {
+  socket.on('sendChatMessage', async (message) => {
     const text = message.trim();
     if (!text) return;
 
     if (text.startsWith('/')) {
-      if (text.toLowerCase() === '/online') {
-        const count = Object.keys(players).length;
+      const [rawCommand, ...rest] = text.split(' ');
+      const command = rawCommand.toLowerCase();
+      const argument = rest.join(' ').trim();
+
+      if (command === '/online') {
         socket.emit('chatMessage', {
           sender: 'SISTEMA',
-          text: `Jugadores en línea: ${count}`,
+          text: `Jugadores en línea: ${Object.keys(players).length}`,
           color: '#ffeb3b'
         });
         return;
       }
+
+      // Comandos de clan (Módulo H)
+      if (command === '/crearclan') { await handleCreateClan(argument); return; }
+      if (command === '/invitar') { await handleInvite(argument); return; }
+      if (command === '/aceptarclan') { await handleAcceptInvite(null); return; }
+      if (command === '/salirclan') { await handleLeaveClan(); return; }
+      if (command === '/expulsar') { await handleKick(argument); return; }
+      if (command === '/disolverclan') { await handleDissolveClan(); return; }
     }
 
     io.emit('chatMessage', {
