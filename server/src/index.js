@@ -31,6 +31,7 @@ const {
   mapRoom,
   mapById,
   portalsOf,
+  findPortal,
   clampToMap
 } = require('./config/maps');
 
@@ -1391,6 +1392,75 @@ io.on('connection', async (socket) => {
 
     // Solo lo ve quien comparte zona: la sala se encarga del filtro
     socket.to(mapRoom(player.mapId)).emit('playerMoved', publicPlayer(player));
+  });
+
+  // Viaje entre zonas (Módulo I): el cliente pide el cambio al pisar un portal y
+  // el servidor comprueba que de verdad esté encima de la puerta. Las
+  // coordenadas de destino las pone el portal del servidor, no el cliente: si no,
+  // cualquiera podría aparecer donde quisiera con solo cambiar el payload.
+  socket.on('requestMapChange', async (payload) => {
+    const player = players[socket.id];
+    if (!player) return;
+
+    const portal = findPortal(player.mapId, payload && payload.targetMapId, player.x, player.y);
+
+    if (!portal) {
+      socket.emit('mapChangeDenied', { targetMapId: Number(payload && payload.targetMapId) || null });
+      notify(socket, 'No hay ningún portal a tu alcance.', '#ff5252');
+      return;
+    }
+
+    if (!player.characterId) return;
+
+    const previousMapId = player.mapId;
+
+    // 1. Salir de la sala vieja y avisar a quien se queda allí
+    socket.leave(mapRoom(previousMapId));
+    socket.to(mapRoom(previousMapId)).emit('playerDisconnected', socket.id);
+
+    // 2. Entrar en la nueva zona, en el punto que fija el portal
+    player.mapId = portal.targetMapId;
+    player.x = clampToMap(portal.targetX);
+    player.y = clampToMap(portal.targetY);
+    socket.join(mapRoom(player.mapId));
+
+    // 3. Persistir el viaje: si el servidor se reinicia, el personaje ya está
+    //    en el mapa nuevo y no vuelve al anterior por arte de magia
+    try {
+      await db.query(
+        `UPDATE characters SET map_id = $1, pos_x = $2, pos_y = $3 WHERE id = $4`,
+        [player.mapId, Math.round(player.x), Math.round(player.y), player.characterId]
+      );
+    } catch (error) {
+      console.error(`⚠️ No se pudo guardar el viaje de ${player.name}:`, error.message);
+    }
+
+    // 4. Avisar a la zona nueva y mandarle al viajero el estado completo del mapa
+    //    en un solo mensaje: así reconstruye el escenario sin estados a medias.
+    socket.to(mapRoom(player.mapId)).emit('newPlayer', publicPlayer(player));
+
+    const arrival = mapById(player.mapId);
+
+    socket.emit('mapChangeSuccess', {
+      mapId: player.mapId,
+      name: arrival.name,
+      width: MAP_SIZE,
+      height: MAP_SIZE,
+      spawn: arrival.spawn,
+      portals: arrival.portals,
+      x: player.x,
+      y: player.y,
+      players: playersSnapshot(player.mapId),
+      monsters: Object.fromEntries(
+        monstersInMap(player.mapId).map((monster) => [monster.id, monster])
+      ),
+      drops: Object.values(worldDrops)
+        .filter((drop) => drop.mapId === player.mapId)
+        .map(publicDrop),
+      npcs: npcsInMap(player.mapId).map(publicNpc)
+    });
+
+    notify(socket, `Has viajado a ${arrival.name}.`, '#66fcf1');
   });
 
   // Combate (Ataque con Espacio)
