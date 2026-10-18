@@ -1,5 +1,7 @@
 import Phaser from 'phaser';
 import { describeSuffix } from '../config/suffixes';
+import { glowTierFor } from '../config/glow';
+import { createGlowSprites } from './glow';
 
 // --- Geometría del panel -----------------------------------------------------
 const PANEL_WIDTH = 448;
@@ -243,11 +245,14 @@ export default class InventoryWindow {
 
       if (!this.scene.textures.exists(item.spriteId)) return;
 
-      const sprite = this.scene.add.sprite(
-        zone.slotX + SLOT_SIZE / 2,
-        zone.slotY + SLOT_SIZE / 2,
-        item.spriteId
-      ).setDisplaySize(24, 24);
+      const centerX = zone.slotX + SLOT_SIZE / 2;
+      const centerY = zone.slotY + SLOT_SIZE / 2;
+
+      // Aura de la forja: el brillo va detrás del ítem, así que se añade antes
+      createGlowSprites(this.scene, centerX, centerY, item.spriteId, glowTierFor(item.enhanceLevel), 24)
+        .forEach((aura) => this.itemLayer.add(aura));
+
+      const sprite = this.scene.add.sprite(centerX, centerY, item.spriteId).setDisplaySize(24, 24);
 
       // Marca de mejora (+1 a +15)
       if (item.enhanceLevel > 0) {

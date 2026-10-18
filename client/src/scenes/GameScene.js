@@ -6,6 +6,8 @@ import SettingsWindow from '../ui/SettingsWindow';
 import ShopWindow from '../ui/ShopWindow';
 import ClanWindow from '../ui/ClanWindow';
 import ForgeWindow from '../ui/ForgeWindow';
+import { glowTierFor, rarityGlowFor } from '../config/glow';
+import { createGlowSprites } from '../ui/glow';
 import { findActionByKey, loadKeybinds, resolveKeyCode, saveKeybinds } from '../config/keybinds';
 
 // Debe coincidir con PICKUP_RANGE del servidor
@@ -1366,11 +1368,22 @@ export default class GameScene extends Phaser.Scene {
     const sprite = this.add.sprite(drop.x, drop.y, drop.spriteId).setDepth(5);
     sprite.dropId = drop.dropId;
     sprite.itemName = drop.name;
+
+    // Aura del botín: una pieza forjada brilla por su nivel y una pieza rara lo
+    // hace por su rareza (el común no brilla, si no no brillaría ninguna). El
+    // servidor manda las dos cosas; aquí solo se pintan, detrás del ítem.
+    const aura = [
+      ...createGlowSprites(this, drop.x, drop.y, drop.spriteId, glowTierFor(drop.enhanceLevel), sprite.width),
+      ...createGlowSprites(this, drop.x, drop.y, drop.spriteId, rarityGlowFor(drop.rarity), sprite.width)
+    ].map((brillo) => brillo.setDepth(4));
+
+    sprite.auraSprites = aura;
     this.worldDropSprites.set(drop.dropId, sprite);
 
-    // Movimiento flotante suave
+    // Movimiento flotante suave. El aura sube y baja con el ítem, por eso va en
+    // los mismos targets.
     this.tweens.add({
-      targets: sprite,
+      targets: [sprite, ...aura],
       y: drop.y - 5,
       duration: 900,
       yoyo: true,
@@ -1387,6 +1400,18 @@ export default class GameScene extends Phaser.Scene {
       repeat: -1,
       ease: 'Sine.easeInOut'
     });
+
+    // El aura respira a su ritmo: el ítem parpadea y el brillo se abre y se cierra
+    if (aura.length > 0) {
+      this.tweens.add({
+        targets: aura,
+        alpha: '-=0.2',
+        duration: 1100,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut'
+      });
+    }
   }
 
   removeWorldDrop(dropId) {
@@ -1394,6 +1419,14 @@ export default class GameScene extends Phaser.Scene {
     if (!sprite) return;
 
     this.tweens.killTweensOf(sprite);
+
+    // El aura vive fuera del sprite: si no se suelta, queda brillando sin dueño
+    if (sprite.auraSprites) {
+      this.tweens.killTweensOf(sprite.auraSprites);
+      sprite.auraSprites.forEach((brillo) => brillo.destroy());
+      sprite.auraSprites = null;
+    }
+
     sprite.destroy();
     this.worldDropSprites.delete(dropId);
   }
