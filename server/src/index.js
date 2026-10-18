@@ -448,6 +448,20 @@ function publicNpc(npc) {
   return { id: npc.id, name: npc.name, x: npc.x, y: npc.y };
 }
 
+// Proyección pública de un jugador. Nunca se manda la ficha interna: dentro vive
+// el temporizador del cierre de sesión, que además no es serializable.
+function publicPlayer(player) {
+  return {
+    playerId: player.playerId,
+    characterId: player.characterId,
+    name: player.name,
+    characterClass: player.characterClass,
+    level: player.level,
+    x: player.x,
+    y: player.y
+  };
+}
+
 // Precio al que el comerciante compra: la mitad del costo base, redondeado a
 // la baja para que el jugador nunca gane oro comprando y vendiendo.
 function salePrice(item) {
@@ -572,13 +586,18 @@ io.on('connection', (socket) => {
     pendingLogout: null  // cuenta regresiva de cierre de sesión en curso
   };
 
-  // Enviar estado inicial al jugador entrante
-  socket.emit('currentPlayers', players);
+  // Enviar estado inicial al jugador entrante. Los jugadores viajan proyectados:
+  // la ficha interna guarda un temporizador que JSON no puede serializar.
+  const snapshot = Object.fromEntries(
+    Object.entries(players).map(([id, other]) => [id, publicPlayer(other)])
+  );
+
+  socket.emit('currentPlayers', snapshot);
   socket.emit('currentMonsters', monsters);
   socket.emit('currentDrops', Object.values(worldDrops).map(publicDrop));
   socket.emit('currentNpcs', [publicNpc(MERCHANT)]);
   socket.emit('shopCatalog', publicShopCatalog());
-  socket.broadcast.emit('newPlayer', players[socket.id]);
+  socket.broadcast.emit('newPlayer', publicPlayer(players[socket.id]));
 
   // Inventario y estadísticas del personaje
   emitInventory(socket, 'currentInventory');
@@ -594,7 +613,7 @@ io.on('connection', (socket) => {
 
     player.x = movementData.x;
     player.y = movementData.y;
-    socket.broadcast.emit('playerMoved', player);
+    socket.broadcast.emit('playerMoved', publicPlayer(player));
   });
 
   // Combate (Ataque con Espacio)
