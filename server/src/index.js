@@ -24,6 +24,15 @@ const authRoutes = require('./routes/authRoutes');
 const characterRoutes = require('./routes/characterRoutes');
 const clanController = require('./controllers/clanController');
 const db = require('./config/db');
+const {
+  MAP_SIZE,
+  DEFAULT_MAP_ID,
+  MAPS,
+  mapRoom,
+  mapById,
+  portalsOf,
+  clampToMap
+} = require('./config/maps');
 
 const app = express();
 const server = http.createServer(app);
@@ -59,34 +68,63 @@ io.use((socket, next) => {
 // Estado global en memoria
 const players = {};
 
+// --- Mapas y salas (Módulo I) -------------------------------------------------
+// Cada mapa tiene su propia sala de Socket.io: el censo, el movimiento, el
+// combate, el botín y el chat solo viajan entre quienes comparten zona.
+
+function emitToMap(mapId, event, payload) {
+  io.to(mapRoom(mapId)).emit(event, payload);
+}
+
+function playersInMap(mapId) {
+  return Object.values(players).filter((player) => player.mapId === mapId);
+}
+
+function monstersInMap(mapId) {
+  return Object.values(monsters).filter((monster) => monster.mapId === mapId);
+}
+
+// Censo de una zona con la misma forma que currentPlayers: un recién llegado
+// recibe solo a los jugadores de su mapa
+function playersSnapshot(mapId) {
+  const snapshot = {};
+
+  playersInMap(mapId).forEach((player) => {
+    snapshot[player.playerId] = publicPlayer(player);
+  });
+
+  return snapshot;
+}
+
+// Proyección pública de una zona: nombre, tamaño, punto de aparición y puertas
+function publicMap(mapId) {
+  const map = mapById(mapId);
+
+  return {
+    id: map.id,
+    name: map.name,
+    width: MAP_SIZE,
+    height: MAP_SIZE,
+    spawn: map.spawn,
+    portals: portalsOf(map.id)
+  };
+}
+
 // Tabla de botín por monstruo (de más común a más raro).
 // Se tira en orden y se detiene en el primer acierto: máximo un ítem por muerte.
-const monsters = {
-  m1: {
-    id: 'm1', name: 'Trasgo', x: 250, y: 200, hp: 50, maxHp: 50, alive: true, xp: 25, gold: 15,
-    drops: [
-      { itemKey: 'potion_health', chance: 0.40 },
-      { itemKey: 'sword_iron', chance: 0.15 },
-      { itemKey: 'gem_light', chance: 0.05 }
-    ]
-  },
-  m2: {
-    id: 'm2', name: 'Orco', x: 550, y: 350, hp: 80, maxHp: 80, alive: true, xp: 50, gold: 30,
-    drops: [
-      { itemKey: 'potion_mana', chance: 0.35 },
-      { itemKey: 'shield_oak', chance: 0.12 },
-      { itemKey: 'soul_sphere', chance: 0.03 }
-    ]
-  },
-  m3: {
-    id: 'm3', name: 'Demonio', x: 350, y: 450, hp: 120, maxHp: 120, alive: true, xp: 90, gold: 60,
-    drops: [
-      { itemKey: 'plate_armor', chance: 0.08 },
-      { itemKey: 'soul_sphere', chance: 0.08 },
-      { itemKey: 'chaos_stone', chance: 0.02 }
-    ]
-  }
-};
+// Cada monstruo sabe en qué zona vive: eso decide a quién se le cuenta.
+const monsters = {};
+
+Object.values(MAPS).forEach((map) => {
+  map.monsters.forEach((spawn) => {
+    monsters[spawn.id] = {
+      ...spawn,
+      mapId: map.id,
+      maxHp: spawn.hp,
+      alive: true
+    };
+  });
+});
 
 // Catálogo de ítems. El servidor es la fuente de verdad: ensureItemTemplates()
 // sincroniza estos datos contra item_templates al arrancar y cachea los ids.
@@ -140,11 +178,13 @@ const CATALOG_BY_NAME = Object.fromEntries(
 // --- Comerciante (Módulo E) --------------------------------------------------
 // Un NPC fijo en el mapa. El servidor es la autoridad: valida distancia, oro y
 // espacio antes de mover un solo dato.
+// Solo la ciudad tiene comerciante: en el bosque no hay a quién vender.
 const MERCHANT = {
   id: 'merchant_1',
   name: 'Comerciante',
-  x: 300,
-  y: 300
+  mapId: 1,
+  x: 1750,
+  y: 1600
 };
 
 const SHOP_RANGE = 50;   // Distancia máxima (px) para comerciar
@@ -238,9 +278,10 @@ const projectiles = {};
 const PROJECTILE_TICK_MS = 50;  // La trayectoria se revisa 20 veces por segundo
 const PROJECTILE_RADIUS = 20;   // Radio de colisión del proyectil
 
-// Tamaño del mapa. Debe coincidir con el lienzo del cliente (800x600)
-const WORLD_WIDTH = 800;
-const WORLD_HEIGHT = 600;
+// Tamaño del mapa. Debe coincidir con los límites de la cámara del cliente:
+// ambos son cuadrículas de 100 x 100 tiles de 32 px.
+const WORLD_WIDTH = MAP_SIZE;
+const WORLD_HEIGHT = MAP_SIZE;
 
 // Regeneración pasiva: fuera de combate la vida y el maná vuelven solos
 const REGEN_INTERVAL_MS = 3000;
@@ -248,9 +289,8 @@ const REGEN_HP_RATIO = 0.03;
 const REGEN_MP_RATIO = 0.05;
 
 // Derribo: todavía no hay sistema de muerte, así que caer a cero devuelve al
-// personaje al centro del mapa con la vida y el maná al máximo.
-const RESPAWN_X = 400;
-const RESPAWN_Y = 320;
+// personaje al punto de aparición de su zona (ver config/maps.js) con la vida y
+// el maná al máximo.
 
 // --- Karma y bando (Módulo H) ---
 // El bando que se guarda en la base de datos solo tiene tres valores y se deriva
@@ -302,7 +342,7 @@ function grantCombatRewards(player, monster) {
   if (killerSocket) emitStats(killerSocket);
 
   if (leveledUp) {
-    io.emit('playerLeveledUp', {
+    emitToMap(player.mapId, 'playerLeveledUp', {
       characterId: player.characterId,
       playerId: player.playerId,
       level: player.level,
@@ -337,10 +377,11 @@ async function finalizeLogout(socket, action) {
     try {
       await db.query(
         `UPDATE characters
-            SET pos_x = $1, pos_y = $2, hp_current = $3, mp_current = $4,
-                experience = $5, gold = $6, stat_points = $7
-          WHERE id = $8`,
+            SET map_id = $1, pos_x = $2, pos_y = $3, hp_current = $4, mp_current = $5,
+                experience = $6, gold = $7, stat_points = $8
+          WHERE id = $9`,
         [
+          player.mapId,
           Math.round(player.x), Math.round(player.y),
           player.hpCurrent, player.mpCurrent,
           player.experience, player.gold, player.statPoints,
@@ -353,7 +394,7 @@ async function finalizeLogout(socket, action) {
   }
 
   delete players[socket.id];
-  io.emit('playerDisconnected', socket.id);
+  io.to(mapRoom(player.mapId)).emit('playerDisconnected', socket.id);
   socket.emit('logoutSuccess', { action });
 
   console.log(`👋 ${player.name} cerró sesión (${action})`);
@@ -432,8 +473,9 @@ function spawnDrop(monster) {
   const item = ITEM_CATALOG[itemKey];
   const dropId = randomUUID();
 
-  worldDrops[dropId] = {
+  const drop = {
     dropId,
+    mapId: monster.mapId,
     itemKey,
     name: item.name,
     spriteId: item.spriteId,
@@ -441,11 +483,13 @@ function spawnDrop(monster) {
     y: monster.y,
     despawnTimer: setTimeout(() => {
       delete worldDrops[dropId];
-      io.emit('itemDespawned', { dropId });
+      emitToMap(drop.mapId, 'itemDespawned', { dropId });
     }, DROP_DESPAWN_MS)
   };
 
-  io.emit('itemDropped', publicDrop(worldDrops[dropId]));
+  worldDrops[dropId] = drop;
+
+  emitToMap(drop.mapId, 'itemDropped', publicDrop(drop));
 }
 
 // --- Combate por clases (Módulo G) -------------------------------------------
@@ -497,7 +541,7 @@ function damageMonster(monster, damage, player, options = {}) {
   monster.hp = Math.max(0, monster.hp - damage);
   markInCombat(player);
 
-  io.emit('monsterDamaged', {
+  emitToMap(monster.mapId, 'monsterDamaged', {
     monsterId: monster.id,
     damage,
     currentHp: monster.hp,
@@ -509,7 +553,7 @@ function damageMonster(monster, damage, player, options = {}) {
   if (monster.hp > 0) return false;
 
   monster.alive = false;
-  io.emit('monsterKilled', {
+  emitToMap(monster.mapId, 'monsterKilled', {
     monsterId: monster.id,
     killedBy: player ? player.name : 'un golpe perdido'
   });
@@ -527,7 +571,7 @@ function damageMonster(monster, damage, player, options = {}) {
   setTimeout(() => {
     monster.hp = monster.maxHp;
     monster.alive = true;
-    io.emit('monsterRespawned', monster);
+    emitToMap(monster.mapId, 'monsterRespawned', monster);
   }, 5000); // Reaparece a los 5 segundos
 
   return true;
@@ -564,7 +608,7 @@ function damagePlayer(target, damage, attacker, options = {}) {
   target.hpCurrent = Math.max(0, target.hpCurrent - damage);
   markInCombat(target);
 
-  io.emit('playerDamaged', {
+  emitToMap(target.mapId, 'playerDamaged', {
     playerId: target.playerId,
     characterId: target.characterId,
     damage,
@@ -588,13 +632,17 @@ function damagePlayer(target, damage, attacker, options = {}) {
   // Derribar también mueve el karma, según el bando de la víctima
   if (attacker) applyKarma(attacker, karmaForDown(target));
 
-  // Derribado: vuelve al centro del mapa con la vida y el maná enteros
+  // Derribado: vuelve al punto de aparición de SU mapa con la vida y el maná
+  // enteros. Con zonas separadas, resucitar en el mapa de al lado sería un viaje
+  // gratis.
+  const respawn = mapById(target.mapId).spawn;
+
   target.hpCurrent = target.hpMax;
   target.mpCurrent = target.mpMax;
-  target.x = RESPAWN_X;
-  target.y = RESPAWN_Y;
+  target.x = respawn.x;
+  target.y = respawn.y;
 
-  io.emit('playerRespawned', {
+  emitToMap(target.mapId, 'playerRespawned', {
     playerId: target.playerId,
     characterId: target.characterId,
     x: target.x,
@@ -607,7 +655,7 @@ function damagePlayer(target, damage, attacker, options = {}) {
 
   if (targetSocket) {
     emitStats(targetSocket);
-    notify(targetSocket, 'Te han derribado: vuelves al centro del mapa.', '#ff5252');
+    notify(targetSocket, 'Te han derribado: vuelves al punto de aparición de la zona.', '#ff5252');
   }
 
   persistVitals(target);
@@ -629,6 +677,7 @@ function spawnProjectile(player, skill, targetX, targetY) {
 
   projectiles[id] = {
     id,
+    mapId: player.mapId,
     skillId: skill.id,
     kind: skill.projectile,
     ownerId: player.playerId,
@@ -642,7 +691,7 @@ function spawnProjectile(player, skill, targetX, targetY) {
     remaining: Math.min(distance, skill.range)
   };
 
-  io.emit('projectileSpawned', {
+  emitToMap(player.mapId, 'projectileSpawned', {
     id,
     skillId: skill.id,
     kind: skill.projectile,
@@ -658,10 +707,12 @@ function spawnProjectile(player, skill, targetX, targetY) {
   return projectiles[id];
 }
 
-// Primer monstruo vivo dentro del radio de colisión del proyectil
+// Primer monstruo vivo dentro del radio de colisión del proyectil y de su misma
+// zona: un proyectil no cruza un portal
 function projectileMonsterHit(projectile) {
   return Object.values(monsters).find((monster) => (
-    monster.alive
+    monster.mapId === projectile.mapId
+      && monster.alive
       && Math.hypot(projectile.x - monster.x, projectile.y - monster.y) <= PROJECTILE_RADIUS
   )) || null;
 }
@@ -669,7 +720,8 @@ function projectileMonsterHit(projectile) {
 // Primer jugador dentro del radio que no sea el dueño del proyectil
 function projectilePlayerHit(projectile) {
   return Object.values(players).find((player) => (
-    player.playerId !== projectile.ownerId
+    player.mapId === projectile.mapId
+      && player.playerId !== projectile.ownerId
       && Math.hypot(projectile.x - player.x, projectile.y - player.y) <= PROJECTILE_RADIUS
   )) || null;
 }
@@ -702,7 +754,7 @@ function tickProjectiles() {
         damagePlayer(target, projectile.damage, owner, { skillId: projectile.skillId });
       }
 
-      io.emit('projectileHit', {
+      emitToMap(projectile.mapId, 'projectileHit', {
         id,
         kind: projectile.kind,
         x: projectile.x,
@@ -719,7 +771,7 @@ function tickProjectiles() {
     if (projectile.remaining <= 0) {
       delete projectiles[id];
 
-      io.emit('projectileHit', {
+      emitToMap(projectile.mapId, 'projectileHit', {
         id,
         kind: projectile.kind,
         x: projectile.x,
@@ -732,7 +784,7 @@ function tickProjectiles() {
       return;
     }
 
-    io.emit('projectileMoved', { id, x: projectile.x, y: projectile.y });
+    emitToMap(projectile.mapId, 'projectileMoved', { id, x: projectile.x, y: projectile.y });
   });
 }
 
@@ -741,7 +793,7 @@ function castArc(player, skill, targetX, targetY) {
   const aim = Math.atan2(targetY - player.y, targetX - player.x);
   const hits = [];
 
-  Object.values(monsters).forEach((monster) => {
+  monstersInMap(player.mapId).forEach((monster) => {
     if (!monster.alive) return;
 
     const distance = Math.hypot(monster.x - player.x, monster.y - player.y);
@@ -755,7 +807,7 @@ function castArc(player, skill, targetX, targetY) {
     hits.push({ monster, damage: skillDamage(player, skill, critical), critical });
   });
 
-  io.emit('skillArc', {
+  emitToMap(player.mapId, 'skillArc', {
     playerId: player.playerId,
     skillId: skill.id,
     x: player.x,
@@ -774,7 +826,7 @@ function castArc(player, skill, targetX, targetY) {
 
 // Primer monstruo vivo al alcance: el apuntado si sigue cerca, si no el más próximo
 function meleeTarget(player, range, targetEntityId) {
-  const close = Object.values(monsters).filter((monster) => (
+  const close = monstersInMap(player.mapId).filter((monster) => (
     monster.alive && Math.hypot(monster.x - player.x, monster.y - player.y) <= range
   ));
 
@@ -801,7 +853,7 @@ function castBlink(player, skill, targetX, targetY, targetEntityId) {
   player.x = clamp(player.x + (dx / distance) * jump, 0, WORLD_WIDTH);
   player.y = clamp(player.y + (dy / distance) * jump, 0, WORLD_HEIGHT);
 
-  io.emit('skillBlink', {
+  emitToMap(player.mapId, 'skillBlink', {
     playerId: player.playerId,
     skillId: skill.id,
     fromX,
@@ -903,7 +955,7 @@ function applyKarma(player, delta) {
   player.faction = factionForKarma(player.karma);
 
   persistKarma(player);
-  io.emit('playerFactionUpdated', publicFaction(player));
+  emitToMap(player.mapId, 'playerFactionUpdated', publicFaction(player));
 
   // El panel del personaje muestra el karma: hay que refrescarlo también
   const socket = io.sockets.sockets.get(player.playerId);
@@ -932,13 +984,14 @@ function karmaForDown(victim) {
 }
 
 // Estado del personaje que decide el servidor. El cliente elige la ficha, pero no
-// su karma, su bando ni su clan: eso lo manda la base de datos.
+// su karma, su bando, su clan ni el mapa donde estaba: eso lo manda la base de
+// datos.
 async function loadCharacterState(characterId) {
   if (!characterId) return null;
 
   try {
     const result = await db.query(
-      `SELECT c.karma, c.faction, c.clan_id, c.clan_rank, cl.name AS clan_name
+      `SELECT c.karma, c.faction, c.clan_id, c.clan_rank, c.map_id, cl.name AS clan_name
          FROM characters c
          LEFT JOIN clans cl ON cl.id = c.clan_id
         WHERE c.id = $1`,
@@ -957,7 +1010,7 @@ async function loadCharacterState(characterId) {
 // Avisa a todo el mundo de que la etiqueta de clan de un jugador cambió: el mapa
 // la borra o la repinta al instante
 function broadcastPlayerClan(player) {
-  io.emit('playerClanUpdated', {
+  emitToMap(player.mapId, 'playerClanUpdated', {
     playerId: player.playerId,
     characterId: player.characterId,
     clanName: player.clanName || null,
@@ -1154,9 +1207,17 @@ function findStockItem(templateId) {
     .find((item) => item.templateId === templateId) || null;
 }
 
-// El comercio exige estar junto al NPC; el cliente solo sugiere la intención
+// El comercio exige estar junto al NPC y en su misma zona; el cliente solo
+// sugiere la intención
 function isNearMerchant(player) {
+  if (player.mapId !== MERCHANT.mapId) return false;
+
   return Math.hypot(player.x - MERCHANT.x, player.y - MERCHANT.y) <= SHOP_RANGE;
+}
+
+// NPCs de una zona. Hoy solo la ciudad tiene comerciante.
+function npcsInMap(mapId) {
+  return MERCHANT.mapId === mapId ? [MERCHANT] : [];
 }
 
 // Resultado de una compra o venta: el panel de tienda lo muestra como
@@ -1217,15 +1278,25 @@ io.on('connection', async (socket) => {
   // la base de datos, no de lo que cuente el cliente en el handshake.
   const stored = await loadCharacterState(char.id);
 
+  // El mapa lo decide el servidor: la ficha de la base de datos manda sobre lo
+  // que el cliente haya mandado en el handshake.
+  const mapId = Number(stored && stored.map_id) || DEFAULT_MAP_ID;
+  const arrival = mapById(mapId).spawn;
+
   // La posición se guarda al cerrar sesión (Módulo F): al volver, el personaje
-  // aparece donde quedó. Sin coordenadas válidas cae al centro del mapa.
-  const spawnX = Number(char.pos_x);
-  const spawnY = Number(char.pos_y);
+  // aparece donde quedó. Una posición que no sea un número, o que caiga fuera
+  // del tablero, no puede dejar al personaje en el vacío: cae al punto de
+  // aparición de su zona.
+  const storedX = Number(char.pos_x);
+  const storedY = Number(char.pos_y);
+  const spawnX = Number.isFinite(storedX) ? clampToMap(storedX) : arrival.x;
+  const spawnY = Number.isFinite(storedY) ? clampToMap(storedY) : arrival.y;
 
   players[socket.id] = {
     playerId: socket.id,
     userId: socket.user.userId,
     characterId: char.id || null,
+    mapId,
     name: char.name || 'Aventurero',
     characterClass: char.character_class || 'Guerrero',
     level: char.level || 1,
@@ -1240,8 +1311,8 @@ io.on('connection', async (socket) => {
     hpMax: Number(char.hp_max) || 0,
     mpCurrent: Number(char.mp_current) || 0,
     mpMax: Number(char.mp_max) || 0,
-    x: Number.isFinite(spawnX) ? spawnX : 400,
-    y: Number.isFinite(spawnY) ? spawnY : 320,
+    x: spawnX,
+    y: spawnY,
     karma: stored ? Number(stored.karma) || 0 : 0,
     faction: (stored && stored.faction) || 'Neutral',
     clanId: (stored && stored.clan_id) || null,
@@ -1252,18 +1323,27 @@ io.on('connection', async (socket) => {
     skillReadyAt: 0      // momento (ms) en que la habilidad vuelve a estar lista
   };
 
-  // Enviar estado inicial al jugador entrante. Los jugadores viajan proyectados:
-  // la ficha interna guarda un temporizador que JSON no puede serializar.
-  const snapshot = Object.fromEntries(
-    Object.entries(players).map(([id, other]) => [id, publicPlayer(other)])
-  );
+  // Enviar estado inicial al jugador entrante. La sala se une ANTES de mandar
+  // nada: a partir de aquí todo lo que se emita a map_<id> ya le llega.
+  socket.join(mapRoom(mapId));
 
-  socket.emit('currentPlayers', snapshot);
-  socket.emit('currentMonsters', monsters);
-  socket.emit('currentDrops', Object.values(worldDrops).map(publicDrop));
-  socket.emit('currentNpcs', [publicNpc(MERCHANT)]);
+  socket.emit('mapInfo', publicMap(mapId));
+
+  // Solo se cuentan los jugadores, los monstruos, el botín y los NPCs de su
+  // zona: el censo de otro mapa no le importa a nadie.
+  socket.emit('currentPlayers', playersSnapshot(mapId));
+  socket.emit('currentMonsters', Object.fromEntries(
+    monstersInMap(mapId).map((monster) => [monster.id, monster])
+  ));
+  socket.emit('currentDrops', Object.values(worldDrops)
+    .filter((drop) => drop.mapId === mapId)
+    .map(publicDrop));
+  socket.emit('currentNpcs', npcsInMap(mapId).map(publicNpc));
   socket.emit('shopCatalog', publicShopCatalog());
-  socket.broadcast.emit('newPlayer', publicPlayer(players[socket.id]));
+
+  // Los jugadores viajan proyectados: la ficha interna guarda un temporizador que
+  // JSON no puede serializar.
+  socket.to(mapRoom(mapId)).emit('newPlayer', publicPlayer(players[socket.id]));
 
   // Inventario y estadísticas del personaje
   emitInventory(socket, 'currentInventory');
@@ -1300,9 +1380,17 @@ io.on('connection', async (socket) => {
     // Moverse cancela un cierre de sesión en curso
     cancelPendingLogout(player);
 
-    player.x = movementData.x;
-    player.y = movementData.y;
-    socket.broadcast.emit('playerMoved', publicPlayer(player));
+    // El cliente no es autoridad sobre la posición: se acota al tablero, así una
+    // cifra absurda no saca al personaje del mundo ni lo deja en NaN.
+    const nextX = Number(movementData.x);
+    const nextY = Number(movementData.y);
+    if (!Number.isFinite(nextX) || !Number.isFinite(nextY)) return;
+
+    player.x = clampToMap(nextX);
+    player.y = clampToMap(nextY);
+
+    // Solo lo ve quien comparte zona: la sala se encarga del filtro
+    socket.to(mapRoom(player.mapId)).emit('playerMoved', publicPlayer(player));
   });
 
   // Combate (Ataque con Espacio)
@@ -1313,8 +1401,9 @@ io.on('connection', async (socket) => {
     // Atacar cancela un cierre de sesión en curso, aunque no acierte
     cancelPendingLogout(player);
 
-    // Buscar monstruos vivos dentro del rango de ataque melee (60px)
-    Object.values(monsters).forEach((m) => {
+    // Buscar monstruos vivos dentro del rango de ataque melee (60px) y de la
+    // misma zona: el golpe no cruza portales
+    monstersInMap(player.mapId).forEach((m) => {
       if (!m.alive) return;
       if (Math.hypot(player.x - m.x, player.y - m.y) > 60) return;
 
@@ -1395,6 +1484,9 @@ io.on('connection', async (socket) => {
     const drop = worldDrops[dropId];
     if (!drop) return;
 
+    // El botín vive en una zona: no se puede recoger el de otro mapa ni de lejos
+    if (drop.mapId !== player.mapId) return;
+
     // Validación de rango en el servidor (el cliente solo sugiere)
     const distance = Math.hypot(player.x - drop.x, player.y - drop.y);
     if (distance > PICKUP_RANGE) return;
@@ -1433,7 +1525,7 @@ io.on('connection', async (socket) => {
 
     clearTimeout(drop.despawnTimer);
     delete worldDrops[dropId];
-    io.emit('itemPickedUp', { dropId });
+    emitToMap(player.mapId, 'itemPickedUp', { dropId });
   });
 
   // Consumir una poción (clic en el inventario)
@@ -2054,9 +2146,12 @@ io.on('connection', async (socket) => {
       const argument = rest.join(' ').trim();
 
       if (command === '/online') {
+        const player = players[socket.id];
+        const here = player ? playersInMap(player.mapId).length : 0;
+
         socket.emit('chatMessage', {
           sender: 'SISTEMA',
-          text: `Jugadores en línea: ${Object.keys(players).length}`,
+          text: `Jugadores en este mapa: ${here}`,
           color: '#ffeb3b'
         });
         return;
@@ -2071,9 +2166,14 @@ io.on('connection', async (socket) => {
       if (command === '/disolverclan') { await handleDissolveClan(); return; }
     }
 
-    io.emit('chatMessage', {
+    // Chat zonal: solo lo lee quien está en el mismo mapa
+    const speaker = players[socket.id];
+
+    if (!speaker) return;
+
+    emitToMap(speaker.mapId, 'chatMessage', {
       playerId: socket.id,
-      sender: players[socket.id]?.name || 'Anónimo',
+      sender: speaker.name,
       text,
       color: '#ffffff'
     });
@@ -2115,7 +2215,9 @@ io.on('connection', async (socket) => {
 
     console.log(`❌ Desconectado: ${player.name}`);
     delete players[socket.id];
-    io.emit('playerDisconnected', socket.id);
+
+    // El aviso sale solo a su zona: los demás mapas no lo han visto nunca
+    io.to(mapRoom(player.mapId)).emit('playerDisconnected', socket.id);
   });
 });
 

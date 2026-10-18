@@ -85,10 +85,13 @@ CREATE TABLE IF NOT EXISTS characters (
     clan_id UUID REFERENCES clans(id) ON DELETE SET NULL,
     clan_rank VARCHAR(20) DEFAULT 'Miembro',
 
-    -- Posición en el Mundo (Mapa 2D)
+    -- Posición en el Mundo (Mapa 2D). El mapa 1 es la Ciudad de Ullathorpe y su
+    -- punto de aparición es la plaza central (1600,1600), igual que en
+    -- server/src/config/maps.js. Un personaje nuevo empieza allí, no en una
+    -- esquina del tablero.
     map_id INT DEFAULT 1,
-    pos_x INT DEFAULT 50,
-    pos_y INT DEFAULT 50,
+    pos_x INT DEFAULT 1600,
+    pos_y INT DEFAULT 1600,
 
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
