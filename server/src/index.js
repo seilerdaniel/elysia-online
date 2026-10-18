@@ -34,6 +34,7 @@ const {
   findPortal,
   clampToMap
 } = require('./config/maps');
+const { rollDropBonuses } = require('./config/loot');
 
 const app = express();
 const server = http.createServer(app);
@@ -484,7 +485,11 @@ function publicDrop(drop) {
     name: drop.name,
     spriteId: drop.spriteId,
     x: drop.x,
-    y: drop.y
+    y: drop.y,
+    rarity: drop.rarity.key,
+    rarityName: drop.rarity.name,
+    color: drop.rarity.color,
+    bonusAttributes: drop.bonusAttributes
   };
 }
 
@@ -495,6 +500,8 @@ function spawnDrop(monster) {
 
   const item = ITEM_CATALOG[itemKey];
   const dropId = randomUUID();
+  // El equipo puede caer bendecido; una poción nunca (ver config/loot.js)
+  const { rarity, bonusAttributes } = rollDropBonuses(item, isEquipable);
 
   const drop = {
     dropId,
@@ -502,6 +509,8 @@ function spawnDrop(monster) {
     itemKey,
     name: item.name,
     spriteId: item.spriteId,
+    rarity,
+    bonusAttributes,
     x: monster.x,
     y: monster.y,
     despawnTimer: setTimeout(() => {
@@ -589,13 +598,19 @@ function damageMonster(monster, damage, player, options = {}) {
     applyKarma(player, KARMA_MONSTER_KILL);
   }
 
-  spawnDrop(monster);
-
+  // La reaparición se programa ANTES de tirar el botín: un error al sortear el
+  // sobre no puede dejar el monstruo muerto para siempre
   setTimeout(() => {
     monster.hp = monster.maxHp;
     monster.alive = true;
     emitToMap(monster.mapId, 'monsterRespawned', monster);
   }, 5000); // Reaparece a los 5 segundos
+
+  try {
+    spawnDrop(monster);
+  } catch (error) {
+    console.error(`⚠️ No se pudo soltar el botín de ${monster.name}:`, error.message);
+  }
 
   return true;
 }
@@ -1317,8 +1332,9 @@ function forgePlanFor(level) {
   };
 }
 
-// Solo se forjan piezas de equipo: una poción no tiene filo que afilar
-function isForgeable(item) {
+// Solo el equipo se puede equipar (y por tanto forjar y salir bendecido): una
+// poción no tiene filo que afilar. La tabla de casilleros es la que decide.
+function isEquipable(item) {
   return Boolean(EQUIP_SLOT_BY_TYPE[item.type]);
 }
 
@@ -1334,7 +1350,7 @@ async function forgeInfoFor(player, itemId, gemItemId, runner = db) {
 
   const item = await loadInventoryItem(runner, itemId, player.characterId);
   if (!item) return rechazo('no_item', 'Ese ítem ya no está en tu inventario.');
-  if (!isForgeable(item)) return rechazo('not_forgeable', `${item.name} no se puede forjar.`);
+  if (!isEquipable(item)) return rechazo('not_forgeable', `${item.name} no se puede forjar.`);
 
   const plan = forgePlanFor(item.enhance_level);
   if (!plan) return rechazo('max', `${item.name} ya está en +${MAX_ENHANCE_LEVEL}.`);
@@ -1673,8 +1689,8 @@ io.on('connection', async (socket) => {
     try {
       // Un solo statement: ocupa el primer slot_index libre (0-29) del inventario
       const result = await db.query(
-        `INSERT INTO inventory_items (character_id, item_template_id, slot_index)
-         SELECT $1, $2, slot
+        `INSERT INTO inventory_items (character_id, item_template_id, slot_index, bonus_attributes)
+         SELECT $1, $2, slot, $3::jsonb
            FROM generate_series(0, 29) AS slot
           WHERE NOT EXISTS (
                 SELECT 1 FROM inventory_items i
@@ -1683,7 +1699,7 @@ io.on('connection', async (socket) => {
           ORDER BY slot
           LIMIT 1
          RETURNING slot_index`,
-        [player.characterId, item.templateId]
+        [player.characterId, item.templateId, JSON.stringify(drop.bonusAttributes || {})]
       );
 
       if (result.rowCount === 0) {
@@ -1702,6 +1718,10 @@ io.on('connection', async (socket) => {
     clearTimeout(drop.despawnTimer);
     delete worldDrops[dropId];
     emitToMap(player.mapId, 'itemPickedUp', { dropId });
+
+    // El que lo recogió tiene que verlo en la mochila al instante: sin esto, los
+    // sufijos recién guardados no aparecen hasta la siguiente acción
+    emitInventory(socket);
   });
 
   // Consumir una poción (clic en el inventario)
