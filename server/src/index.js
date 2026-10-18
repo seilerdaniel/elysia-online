@@ -138,6 +138,18 @@ const PICKUP_RANGE = 40;       // Distancia máxima (px) para recoger un ítem
 const XP_POR_NIVEL = 100;
 const STAT_POINTS_POR_NIVEL = 5;
 
+// Reparto de puntos de estadística (Módulo D): cada punto sube 1 el atributo
+// elegido, y la vitalidad / inteligencia arrastran sus valores derivados.
+const HP_POR_VITALIDAD = 10;
+const MP_POR_INTELIGENCIA = 8;
+const ASSIGNABLE_ATTRIBUTES = ['fuerza', 'agilidad', 'inteligencia', 'vitalidad'];
+const ATTRIBUTE_LABELS = {
+  fuerza: 'Fuerza',
+  agilidad: 'Agilidad',
+  inteligencia: 'Inteligencia',
+  vitalidad: 'Vitalidad'
+};
+
 // Guarda experiencia, oro, nivel y puntos de estadística del personaje en PostgreSQL
 async function persistCharacterProgress(player) {
   if (!player.characterId) return;
@@ -175,6 +187,10 @@ function grantCombatRewards(player, monster) {
       level: player.level,
       statPoints: player.statPoints
     });
+
+    // El panel de personaje debe reflejar el nivel nuevo y los puntos ganados
+    const socket = io.sockets.sockets.get(player.playerId);
+    if (socket) emitStats(socket);
   }
 }
 
@@ -331,6 +347,10 @@ function emitStats(socket) {
     experience: player.experience,
     gold: player.gold,
     statPoints: player.statPoints,
+    fuerza: player.fuerza,
+    agilidad: player.agilidad,
+    inteligencia: player.inteligencia,
+    vitalidad: player.vitalidad,
     hpCurrent: player.hpCurrent,
     hpMax: player.hpMax,
     mpCurrent: player.mpCurrent,
@@ -404,6 +424,7 @@ io.on('connection', (socket) => {
     fuerza: Number(char.fuerza) || 0,
     agilidad: Number(char.agilidad) || 0,
     inteligencia: Number(char.inteligencia) || 0,
+    vitalidad: Number(char.vitalidad) || 0,
     hpCurrent: Number(char.hp_current) || 0,
     hpMax: Number(char.hp_max) || 0,
     mpCurrent: Number(char.mp_current) || 0,
@@ -717,6 +738,67 @@ io.on('connection', (socket) => {
 
     notify(socket, `Desequipas ${unequippedName}.`);
     emitInventory(socket);
+  });
+
+  // Reparte un punto de estadística (Módulo D, panel de personaje con la tecla C)
+  socket.on('assignStatPoint', async (payload) => {
+    const attribute = payload && payload.attribute;
+    const player = players[socket.id];
+
+    if (!player || !player.characterId) return;
+
+    if (!ASSIGNABLE_ATTRIBUTES.includes(attribute)) {
+      notify(socket, 'Atributo desconocido.', '#ff5252');
+      return;
+    }
+
+    if (player.statPoints <= 0) {
+      notify(socket, 'No te quedan puntos de estadística.', '#ff5252');
+      return;
+    }
+
+    // Se calcula el estado resultante completo y solo se aplica si la base confirma
+    const next = {
+      fuerza: player.fuerza,
+      agilidad: player.agilidad,
+      inteligencia: player.inteligencia,
+      vitalidad: player.vitalidad,
+      statPoints: player.statPoints - 1,
+      hpMax: player.hpMax,
+      hpCurrent: player.hpCurrent,
+      mpMax: player.mpMax,
+      mpCurrent: player.mpCurrent
+    };
+
+    next[attribute] += 1;
+
+    if (attribute === 'vitalidad') {
+      next.hpMax += HP_POR_VITALIDAD;
+      next.hpCurrent += HP_POR_VITALIDAD;
+    } else if (attribute === 'inteligencia') {
+      next.mpMax += MP_POR_INTELIGENCIA;
+      next.mpCurrent += MP_POR_INTELIGENCIA;
+    }
+
+    try {
+      await db.query(
+        `UPDATE characters
+            SET fuerza = $1, agilidad = $2, inteligencia = $3, vitalidad = $4,
+                stat_points = $5, hp_max = $6, hp_current = $7, mp_max = $8, mp_current = $9
+          WHERE id = $10`,
+        [next.fuerza, next.agilidad, next.inteligencia, next.vitalidad, next.statPoints,
+          next.hpMax, next.hpCurrent, next.mpMax, next.mpCurrent, player.characterId]
+      );
+    } catch (error) {
+      console.error(`⚠️ No se pudo repartir el punto de ${player.name}:`, error.message);
+      notify(socket, 'No se pudo asignar el punto.', '#ff5252');
+      return;
+    }
+
+    Object.assign(player, next);
+
+    notify(socket, `${ATTRIBUTE_LABELS[attribute]} +1 (te quedan ${player.statPoints} puntos).`, '#a5d6a7');
+    emitStats(socket);
   });
 
   // Chat y Comandos
