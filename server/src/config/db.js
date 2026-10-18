@@ -5,7 +5,7 @@ const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 5432,
   user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'admin123',
+  password: process.env.DB_PASSWORD, // credencial: sin valor por defecto (validada en index.js)
   database: process.env.DB_NAME || 'elysia_db',
 });
 

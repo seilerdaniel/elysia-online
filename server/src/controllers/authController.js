@@ -36,7 +36,7 @@ exports.register = async (req, res) => {
     // Generar JWT
     const token = jwt.sign(
       { userId: user.id, username: user.username },
-      process.env.JWT_SECRET || 'secret',
+      process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -80,7 +80,7 @@ exports.login = async (req, res) => {
     // Generar JWT
     const token = jwt.sign(
       { userId: user.id, username: user.username },
-      process.env.JWT_SECRET || 'secret',
+      process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
 
