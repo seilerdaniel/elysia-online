@@ -1,0 +1,18 @@
+{
+  "name": "elysia-online-client",
+  "version": "0.1.0",
+  "description": "Cliente 2D Pixel Art para Elysia Online en Phaser 3",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "phaser": "^3.80.0",
+    "socket.io-client": "^4.8.4"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elysia Online - MMORPG</title>
+  <style>
+    * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    body {
+      margin: 0; padding: 0; background-color: #0b0c10; color: #ffffff;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      min-height: 100vh; overflow: hidden;
+    }
+    #game-container {
+      border: 2px solid #1f2833; box-shadow: 0 0 25px rgba(102, 252, 241, 0.2);
+      border-radius: 6px; position: relative; width: 800px; height: 600px;
+    }
+
+    /* Modal de Autenticación Overlay */
+    #auth-overlay {
+      position: absolute; top: 0; left: 0; width: 800px; height: 600px;
+      background: rgba(11, 12, 16, 0.95); backdrop-filter: blur(4px);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      z-index: 20; border-radius: 4px;
+    }
+    .auth-box {
+      background: #1f2833; padding: 30px; border-radius: 8px; border: 1px solid #45a29e;
+      width: 320px; display: flex; flex-direction: column; gap: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+    }
+    .auth-box h2 { margin: 0 0 10px 0; color: #66fcf1; text-align: center; letter-spacing: 1px; }
+    .auth-box input {
+      background: #0b0c10; border: 1px solid #45a29e; color: #fff; padding: 10px;
+      border-radius: 4px; outline: none; font-size: 14px;
+    }
+    .auth-box button {
+      background: #66fcf1; color: #0b0c10; font-weight: bold; border: none; padding: 12px;
+      border-radius: 4px; cursor: pointer; transition: all 0.2s; font-size: 14px;
+    }
+    .auth-box button:hover { background: #45a29e; color: #fff; }
+    #char-select-list { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+    .char-card {
+      background: #0b0c10; border: 1px solid #66fcf1; padding: 12px; border-radius: 4px;
+      cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+    }
+    .char-card:hover { background: #1f2833; }
+
+    /* HUD - Caja de Chat */
+    #chat-wrapper {
+      position: absolute; bottom: 12px; left: 12px; width: 340px;
+      z-index: 10; pointer-events: none;
+    }
+    #chat-logs {
+      height: 120px; overflow-y: auto; background: rgba(0,0,0,0.65);
+      border: 1px solid rgba(102, 252, 241, 0.3); border-radius: 4px; padding: 6px 10px;
+      font-size: 12px; display: flex; flex-direction: column; gap: 4px;
+    }
+    .chat-msg { text-shadow: 1px 1px 2px #000; word-break: break-word; }
+    #chat-input {
+      width: 100%; margin-top: 6px; padding: 8px 10px; background: rgba(11, 12, 16, 0.9);
+      border: 1px solid #66fcf1; color: #fff; border-radius: 4px; outline: none;
+      font-size: 13px; pointer-events: auto; display: none;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <!-- UI Auth -->
+    <div id="auth-overlay">
+      <div id="login-form" class="auth-box">
+        <h2>ELYSIA ONLINE</h2>
+        <input type="text" id="username" placeholder="Usuario" value="seiler" />
+        <input type="password" id="password" placeholder="Contraseña" value="mypassword123" />
+        <button id="btn-login">Ingresar al Juego</button>
+      </div>
+      <div id="char-select" class="auth-box hidden">
+        <h2>PERSONAJES</h2>
+        <div id="char-select-list"></div>
+      </div>
+    </div>
+
+    <!-- UI Chat HUD -->
+    <div id="chat-wrapper" class="hidden">
+      <div id="chat-logs"></div>
+      <input type="text" id="chat-input" placeholder="Escribe un mensaje y presiona Enter..." />
+    </div>
+  </div>
+  <script type="module" src="/src/index.js"></script>
+</body>
+</html>
