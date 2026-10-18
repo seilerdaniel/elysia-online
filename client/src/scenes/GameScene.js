@@ -5,6 +5,7 @@ import CharacterWindow from '../ui/CharacterWindow';
 import SettingsWindow from '../ui/SettingsWindow';
 import ShopWindow from '../ui/ShopWindow';
 import ClanWindow from '../ui/ClanWindow';
+import ForgeWindow from '../ui/ForgeWindow';
 import { findActionByKey, loadKeybinds, resolveKeyCode, saveKeybinds } from '../config/keybinds';
 
 // Debe coincidir con PICKUP_RANGE del servidor
@@ -65,6 +66,7 @@ export default class GameScene extends Phaser.Scene {
     this.characterWindow = null;
     this.settingsWindow = null;
     this.shopWindow = null;
+    this.forgeWindow = null;
     this.playerStats = null;
     this.keybinds = null;
     this.chatInputHandlers = null;
@@ -179,17 +181,25 @@ export default class GameScene extends Phaser.Scene {
     // 9. Ventana de clan en Canvas (se abre con la tecla K)
     this.clanWindow = new ClanWindow(this, this.socket);
 
+    // 10. Yunque en Canvas (se abre con la tecla F): forja de ítems (Módulo J)
+    this.forgeWindow = new ForgeWindow(this, this.socket);
+
     this.socket.on('clanInfo', (state) => this.clanWindow.setClanState(state));
     this.socket.on('clanInviteReceived', (invite) => this.clanWindow.addInvite(invite));
 
-    // 10. Los paneles son HUD: siguen anclados a la pantalla aunque la cámara
+    // La forja no decide nada: pregunta al servidor y pinta su respuesta
+    this.socket.on('forgeInfo', (info) => this.forgeWindow.setPlan(info));
+    this.socket.on('itemEnhanced', (data) => this.forgeWindow.showEnhanced(data));
+
+    // 11. Los paneles son HUD: siguen anclados a la pantalla aunque la cámara
     // siga al personaje por un mundo de 3200 px
     [
       this.inventoryWindow,
       this.characterWindow,
       this.settingsWindow,
       this.shopWindow,
-      this.clanWindow
+      this.clanWindow,
+      this.forgeWindow
     ].forEach((panel) => this.pinToScreen(panel));
 
     // --- Eventos de WebSockets: Jugadores ---
@@ -402,11 +412,13 @@ export default class GameScene extends Phaser.Scene {
     this.socket.on('currentInventory', (items) => {
       this.inventoryWindow.setItems(items);
       this.shopWindow.setBackpack(items);
+      this.forgeWindow.setItems(items);
     });
 
     this.socket.on('inventoryUpdated', (items) => {
       this.inventoryWindow.setItems(items);
       this.shopWindow.setBackpack(items);
+      this.forgeWindow.setItems(items);
     });
 
     this.socket.on('playerStatsUpdated', (stats) => {
@@ -414,6 +426,7 @@ export default class GameScene extends Phaser.Scene {
       this.inventoryWindow.setStats(stats);
       this.characterWindow.setStats(stats);
       this.shopWindow.setStats(stats);
+      this.forgeWindow.setStats(stats);
       this.updateInventoryPlayer(stats.level);
       this.updateLocalBars();
     });
@@ -506,6 +519,9 @@ export default class GameScene extends Phaser.Scene {
       case 'clan':
         if (this.clanWindow.toggle()) this.closeOtherWindows('clan');
         break;
+      case 'forge':
+        if (this.forgeWindow.toggle()) this.closeOtherWindows('forge');
+        break;
       case 'potionHp':
         this.usePotion('hp');
         break;
@@ -565,7 +581,8 @@ export default class GameScene extends Phaser.Scene {
       character: this.characterWindow,
       settings: this.settingsWindow,
       shop: this.shopWindow,
-      clan: this.clanWindow
+      clan: this.clanWindow,
+      forge: this.forgeWindow
     };
 
     Object.entries(panels).forEach(([id, panel]) => {

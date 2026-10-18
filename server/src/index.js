@@ -1313,6 +1313,11 @@ const INVENTORY_QUERY = `
 function serializeInventoryItem(row) {
   const catalogItem = CATALOG_BY_NAME[row.name];
 
+  // El daño y la defensa que se enseñan son los que el ítem hace HOY, ya
+  // multiplicados por la forja: si no, un +15 mentiría en el tooltip y el jugador
+  // no entendería por qué pega más de lo que dice su espada
+  const escala = 1 + ENHANCE_DAMAGE_PER_LEVEL * (Number(row.enhance_level) || 0);
+
   return {
     id: row.id,
     templateId: row.item_template_id,
@@ -1334,9 +1339,14 @@ function serializeInventoryItem(row) {
       inteligencia: row.req_inteligencia
     },
     stats: {
-      damageMin: row.base_damage_min,
-      damageMax: row.base_damage_max,
-      defense: row.base_defense
+      damageMin: Math.round(Number(row.base_damage_min || 0) * escala),
+      damageMax: Math.round(Number(row.base_damage_max || 0) * escala),
+      defense: Math.round(Number(row.base_defense || 0) * escala)
+    },
+    baseStats: {
+      damageMin: Number(row.base_damage_min || 0),
+      damageMax: Number(row.base_damage_max || 0),
+      defense: Number(row.base_defense || 0)
     }
   };
 }

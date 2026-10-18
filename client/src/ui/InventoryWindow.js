@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { describeSuffix } from '../config/suffixes';
 
 // --- Geometría del panel -----------------------------------------------------
 const PANEL_WIDTH = 448;
@@ -289,27 +290,63 @@ export default class InventoryWindow {
     );
   }
 
+  // El daño y la defensa que se enseñan son los que el ítem hace HOY: el servidor
+  // ya los manda multiplicados por la forja. Entre paréntesis va el valor de
+  // fábrica, para que se vea de un vistazo lo que aportó la mejora.
+  describeDamage(item) {
+    const stats = item.stats || {};
+    const min = Number(stats.damageMin) || 0;
+    const max = Number(stats.damageMax) || 0;
+
+    if (min <= 0 && max <= 0) return null;
+
+    return `Daño: ${min}-${max}${this.forgeNote(item)}`;
+  }
+
+  describeDefense(item) {
+    const valor = Number((item.stats || {}).defense) || 0;
+
+    if (valor <= 0) return null;
+
+    return `Defensa: ${valor}${this.forgeNote(item)}`;
+  }
+
+  forgeNote(item) {
+    const base = item.baseStats;
+    if (!base || Number(item.enhanceLevel) <= 0) return '';
+
+    const partes = [];
+    if (Number(base.damageMax) > 0) partes.push(`base ${base.damageMin}-${base.damageMax}`);
+    if (Number(base.defense) > 0) partes.push(`base ${base.defense}`);
+
+    return partes.length > 0 ? `  (${partes.join(', ')})` : '';
+  }
+
   buildTooltipLines(item) {
+    const nivel = Number(item.enhanceLevel) || 0;
+
     const lines = [
-      { text: `${item.name}  +${item.enhanceLevel}`, color: GOLD },
+      {
+        text: nivel > 0 ? `${item.name}  +${nivel}` : item.name,
+        color: nivel > 0 ? GOLD : GREY
+      },
       { text: `Tipo: ${item.type}`, color: GREY }
     ];
 
-    if (item.stats.damageMin > 0 || item.stats.damageMax > 0) {
-      lines.push({ text: `Daño: ${item.stats.damageMin}-${item.stats.damageMax}`, color: '#ff8a80' });
-    }
+    const daño = this.describeDamage(item);
+    if (daño) lines.push({ text: daño, color: '#ff8a80' });
 
-    if (item.stats.defense > 0) {
-      lines.push({ text: `Defensa: ${item.stats.defense}`, color: '#90caf9' });
-    }
+    const defensa = this.describeDefense(item);
+    if (defensa) lines.push({ text: defensa, color: '#90caf9' });
 
     if (item.effect) {
       lines.push({ text: `Efecto: +${item.effect.amount} ${item.effect.stat.toUpperCase()}`, color: '#a5d6a7' });
     }
 
-    // Atributos aleatorios estilo Diablo (JSONB)
+    // Sufijos aleatorios del botín (JSONB). Las claves crudas las traduce
+    // describeSuffix: 'daño_critico: 9' se lee mejor como 'Daño crítico +9%'
     Object.entries(item.bonusAttributes || {}).forEach(([key, value]) => {
-      lines.push({ text: `${key}: ${value}`, color: '#b39ddb' });
+      lines.push({ text: describeSuffix(key, value), color: '#b39ddb' });
     });
 
     if (item.equipSlot) {
