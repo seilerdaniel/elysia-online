@@ -197,7 +197,7 @@ async function inviteToClan({ characterId, targetName }) {
     [inviter.clan_id, target.id, characterId]
   );
 
-  return { ok: true, targetId: target.id, targetName: target.name, clanName: clan.name };
+  return { ok: true, clanId: inviter.clan_id, targetId: target.id, targetName: target.name, clanName: clan.name };
 }
 
 // Acepta la invitación pendiente y mete al personaje en el clan como miembro

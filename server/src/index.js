@@ -1935,7 +1935,11 @@ io.on('connection', async (socket) => {
     const guestSocket = guest && io.sockets.sockets.get(guest.playerId);
 
     if (guestSocket) {
-      guestSocket.emit('clanInviteReceived', { clanName: result.clanName, from: player.name });
+      guestSocket.emit('clanInviteReceived', {
+        clanId: result.clanId,
+        clanName: result.clanName,
+        from: player.name
+      });
       notify(guestSocket, `${player.name} te invita al clan ${result.clanName}. Acepta con /aceptarclan.`, '#ffd700');
     }
   }
