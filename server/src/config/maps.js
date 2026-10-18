@@ -21,7 +21,7 @@ const MAPS = {
     spawn: { x: 1600, y: 1600 },
     monsters: [
       {
-        id: 'm1', name: 'Trasgo', x: 900, y: 800, hp: 50, xp: 25, gold: 15,
+        id: 'm1', name: 'Trasgo', x: 900, y: 800, hp: 120, xp: 40, gold: 25,
         drops: [
           { itemKey: 'potion_health', chance: 0.40 },
           { itemKey: 'sword_iron', chance: 0.15 },
@@ -29,7 +29,7 @@ const MAPS = {
         ]
       },
       {
-        id: 'm2', name: 'Orco', x: 2400, y: 1000, hp: 80, xp: 50, gold: 30,
+        id: 'm2', name: 'Orco', x: 2400, y: 1000, hp: 190, xp: 80, gold: 50,
         drops: [
           { itemKey: 'potion_mana', chance: 0.35 },
           { itemKey: 'shield_oak', chance: 0.12 },
@@ -37,7 +37,7 @@ const MAPS = {
         ]
       },
       {
-        id: 'm3', name: 'Demonio', x: 2300, y: 2400, hp: 120, xp: 90, gold: 60,
+        id: 'm3', name: 'Demonio', x: 2300, y: 2400, hp: 300, xp: 150, gold: 100,
         drops: [
           { itemKey: 'plate_armor', chance: 0.08 },
           { itemKey: 'soul_sphere', chance: 0.08 },
@@ -67,7 +67,7 @@ const MAPS = {
     spawn: { x: 1600, y: 1600 },
     monsters: [
       {
-        id: 'm4', name: 'Lobo Sombrío', x: 800, y: 2200, hp: 70, xp: 40, gold: 20,
+        id: 'm4', name: 'Lobo Sombrío', x: 800, y: 2200, hp: 170, xp: 65, gold: 35,
         drops: [
           { itemKey: 'potion_health', chance: 0.30 },
           { itemKey: 'gem_light', chance: 0.10 },
@@ -75,7 +75,7 @@ const MAPS = {
         ]
       },
       {
-        id: 'm5', name: 'Araña Gigante', x: 2100, y: 900, hp: 60, xp: 35, gold: 18,
+        id: 'm5', name: 'Araña Gigante', x: 2100, y: 900, hp: 150, xp: 55, gold: 30,
         drops: [
           { itemKey: 'potion_mana', chance: 0.30 },
           { itemKey: 'shield_oak', chance: 0.08 },
@@ -83,7 +83,7 @@ const MAPS = {
         ]
       },
       {
-        id: 'm6', name: 'Ent Centinela', x: 1500, y: 2500, hp: 160, xp: 120, gold: 80,
+        id: 'm6', name: 'Ent Centinela', x: 1500, y: 2500, hp: 400, xp: 200, gold: 130,
         drops: [
           { itemKey: 'plate_armor', chance: 0.10 },
           { itemKey: 'soul_sphere', chance: 0.10 },

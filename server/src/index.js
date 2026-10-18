@@ -145,15 +145,15 @@ const ITEM_CATALOG = {
   },
   sword_iron: {
     name: 'Espada de Hierro', type: 'Arma', spriteId: 'sword', price: 100,
-    req: { level: 1, fuerza: 18 }
+    damage: [10, 18], req: { level: 1, fuerza: 18 }
   },
   shield_oak: {
     name: 'Escudo de Roble', type: 'Escudo', spriteId: 'shield', price: 80,
-    req: { level: 1, fuerza: 15 }
+    defense: 12, req: { level: 1, fuerza: 15 }
   },
   plate_armor: {
     name: 'Coraza de Placas', type: 'Armadura', spriteId: 'armor', price: 150,
-    req: { level: 2, fuerza: 20 }
+    defense: 24, req: { level: 2, fuerza: 20 }
   },
   gem_light: {
     name: 'Gema de Luz', type: 'Gema', spriteId: 'gem', price: 30, req: { level: 1 }
@@ -198,6 +198,19 @@ const CHAOS_CHANCE = { 10: 0.5, 11: 0.46, 12: 0.42, 13: 0.38, 14: 0.34, 15: 0.3 
 const FORGE_GOLD_PER_LEVEL = 30;
 
 const MAX_ENHANCE_LEVEL = 15;
+
+// --- Equipo y combate (Módulo J) ---------------------------------------------
+// La forja y los sufijos no valen nada si no se notan al pelear: este bloque
+// convierte lo que el personaje lleva puesto en daño, defensa y vida robada.
+const ENHANCE_DAMAGE_PER_LEVEL = 0.10; // +10% de daño y defensa por nivel de forja
+const CRIT_DEFAULT_MULTIPLIER = 1.5;   // Para las clases sin crítico propio
+const MIN_DAMAGE = 1;                  // Un golpe nunca se anula del todo
+
+// La defensa no se resta en plano: con una resta directa, un set de +15 anularía
+// cualquier golpe entrante y el PvP se volvería un chiste de 1 de daño. La curva
+// defensa / (defensa + K) reduce un porcentaje que crece cada vez más despacio:
+// 12 de defensa recorta un 11%, 50 recorta un 33%, 150 recorta un 60%.
+const ARMOR_MITIGATION_K = 100;
 
 // --- Comerciante (Módulo E) --------------------------------------------------
 // Un NPC fijo en el mapa. El servidor es la autoridad: valida distancia, oro y
@@ -434,6 +447,13 @@ async function ensureItemTemplates() {
     const reqAgilidad = req.agilidad || 0;
     const reqInteligencia = req.inteligencia || 0;
 
+    // El daño y la defensa también viven en el catálogo: son la base que la forja
+    // multiplica, así que la base de datos y el código tienen que decir lo mismo.
+    const damage = item.damage || [0, 0];
+    const damageMin = damage[0];
+    const damageMax = damage[1];
+    const defense = item.defense || 0;
+
     const existing = await db.query(
       'SELECT id FROM item_templates WHERE name = $1 ORDER BY id LIMIT 1',
       [item.name]
@@ -445,10 +465,12 @@ async function ensureItemTemplates() {
       const updated = await db.query(
         `UPDATE item_templates
             SET type = $2, sprite_id = $3, req_level = $4,
-                req_fuerza = $5, req_agilidad = $6, req_inteligencia = $7
+                req_fuerza = $5, req_agilidad = $6, req_inteligencia = $7,
+                base_damage_min = $8, base_damage_max = $9, base_defense = $10
           WHERE id = $1
           RETURNING id`,
-        [existing.rows[0].id, item.type, item.spriteId, reqLevel, reqFuerza, reqAgilidad, reqInteligencia]
+        [existing.rows[0].id, item.type, item.spriteId, reqLevel, reqFuerza, reqAgilidad,
+          reqInteligencia, damageMin, damageMax, defense]
       );
       item.templateId = updated.rows[0].id;
       continue;
@@ -456,10 +478,12 @@ async function ensureItemTemplates() {
 
     const inserted = await db.query(
       `INSERT INTO item_templates
-         (name, type, sprite_id, req_level, req_fuerza, req_agilidad, req_inteligencia)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (name, type, sprite_id, req_level, req_fuerza, req_agilidad, req_inteligencia,
+          base_damage_min, base_damage_max, base_defense)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
-      [item.name, item.type, item.spriteId, reqLevel, reqFuerza, reqAgilidad, reqInteligencia]
+      [item.name, item.type, item.spriteId, reqLevel, reqFuerza, reqAgilidad, reqInteligencia,
+        damageMin, damageMax, defense]
     );
     item.templateId = inserted.rows[0].id;
   }
@@ -546,12 +570,149 @@ function skillDenied(socket, text) {
   socket.emit('skillDenied', { text });
 }
 
+// --- Perfil de combate (Módulo J) --------------------------------------------
+// Lo que aporta el equipo puesto. Se recalcula cada vez que cambia algo que se
+// lleva encima: es el único camino por el que la forja y los sufijos llegan a la
+// fórmula de daño.
+
+function emptyCombatProfile() {
+  return {
+    weaponMin: 0,
+    weaponMax: 0,
+    defense: 0,
+    bonuses: {},      // Sufijos acumulados, tal como se guardan en el JSONB
+    critChance: 0,    // Fracción (0.05 = 5 puntos de crítico)
+    lifeSteal: 0,     // Fracción del daño que vuelve como vida
+    speed: 0          // Fracción extra de velocidad de movimiento
+  };
+}
+
+function combatProfile(player) {
+  return (player && player.combat) || emptyCombatProfile();
+}
+
+async function refreshCombatProfile(player) {
+  if (!player || !player.characterId) return null;
+
+  const profile = emptyCombatProfile();
+
+  try {
+    const result = await db.query(
+      `SELECT i.enhance_level, i.bonus_attributes,
+              t.base_damage_min, t.base_damage_max, t.base_defense
+         FROM inventory_items i
+         JOIN item_templates t ON t.id = i.item_template_id
+        WHERE i.character_id = $1 AND i.is_equipped = TRUE`,
+      [player.characterId]
+    );
+
+    for (const row of result.rows) {
+      const escala = 1 + ENHANCE_DAMAGE_PER_LEVEL * (Number(row.enhance_level) || 0);
+
+      // Un arma aporta daño; un escudo o una coraza, defensa. La forja multiplica
+      // las dos cosas por igual: +10% por nivel.
+      profile.weaponMin += Math.round(Number(row.base_damage_min || 0) * escala);
+      profile.weaponMax += Math.round(Number(row.base_damage_max || 0) * escala);
+      profile.defense += Math.round(Number(row.base_defense || 0) * escala);
+
+      for (const [clave, valor] of Object.entries(row.bonus_attributes || {})) {
+        const cantidad = Number(valor) || 0;
+        profile.bonuses[clave] = (profile.bonuses[clave] || 0) + cantidad;
+
+        if (clave === 'daño_critico') profile.critChance += cantidad / 100;
+        else if (clave === 'robo_vida') profile.lifeSteal += cantidad / 100;
+        else if (clave === 'velocidad') profile.speed += cantidad / 100;
+        // fuerza, agilidad e inteligencia entran como atributos efectivos
+      }
+    }
+  } catch (error) {
+    console.error(`⚠️ No se pudo calcular el equipo de ${player.name}:`, error.message);
+  }
+
+  player.combat = profile;
+  return profile;
+}
+
+// La ficha del personaje más lo que suma el equipo. Las fórmulas de las
+// habilidades ya están escritas contra player.fuerza y compañía, así que se les
+// pasa esta vista: un sufijo de fuerza sube el golpe del Guerrero por la vía
+// natural (fuerza x 1.8) y no se cuenta dos veces como bono suelto.
+function combatStats(player) {
+  const bonuses = combatProfile(player).bonuses;
+
+  return {
+    ...player,
+    fuerza: player.fuerza + (Number(bonuses.fuerza) || 0),
+    agilidad: player.agilidad + (Number(bonuses.agilidad) || 0),
+    inteligencia: player.inteligencia + (Number(bonuses.inteligencia) || 0)
+  };
+}
+
+// Tirada del arma equipada, ya escalada por la forja. Sin arma devuelve 0 sin
+// gastar dado: las manos desnudas no llevan filo.
+function weaponRoll(player) {
+  const profile = combatProfile(player);
+  if (profile.weaponMax <= 0) return 0;
+
+  return Math.round(profile.weaponMin + Math.random() * (profile.weaponMax - profile.weaponMin));
+}
+
+// Probabilidad de crítico: la que trae la habilidad más la que da el equipo.
+// Solo el Guerrero nacía con crítico; con un sufijo de daño crítico cualquier
+// clase puede pillar el suyo.
+function critChanceFor(player, skill) {
+  return clamp((skill.critChance || 0) + combatProfile(player).critChance, 0, 1);
+}
+
 // Daño de una habilidad, redondeado y nunca por debajo de 1: un atributo bajo no
 // debe convertir la habilidad en un gesto inútil
 function skillDamage(player, skill, critical) {
-  const base = Math.max(1, Math.round(skill.damage(player)));
+  const arma = weaponRoll(player);
+  const habilidad = Math.max(1, Math.round(skill.damage(combatStats(player))));
+  const base = Math.max(MIN_DAMAGE, Math.round(arma + habilidad));
 
-  return critical ? Math.round(base * (skill.critMultiplier || 1)) : base;
+  return critical ? Math.round(base * (skill.critMultiplier || CRIT_DEFAULT_MULTIPLIER)) : base;
+}
+
+// El daño entrante pasa por la defensa del que lo recibe (ver ARMOR_MITIGATION_K)
+function mitigatedDamage(target, damage) {
+  const defensa = combatProfile(target).defense;
+  if (defensa <= 0) return damage;
+
+  const reduccion = defensa / (defensa + ARMOR_MITIGATION_K);
+
+  return Math.max(MIN_DAMAGE, Math.round(damage * (1 - reduccion)));
+}
+
+// Robo de vida: el atacante recupera un porcentaje del daño que acaba de hacer.
+// Se aplica golpe a golpe, así que un abanico que toca a tres monstruos chupa de
+// los tres.
+function applyLifeSteal(player, damage) {
+  const perfil = combatProfile(player);
+
+  if (!player || !player.characterId || perfil.lifeSteal <= 0 || !player.hpMax) return;
+  if (player.hpCurrent >= player.hpMax) return;
+
+  const antes = player.hpCurrent;
+  const curacion = Math.max(1, Math.round(damage * perfil.lifeSteal));
+
+  player.hpCurrent = Math.min(player.hpMax, player.hpCurrent + curacion);
+
+  const curado = Math.round(player.hpCurrent - antes);
+  if (curado <= 0) return;
+
+  const socket = io.sockets.sockets.get(player.playerId);
+  if (!socket) return;
+
+  socket.emit('playerHealed', {
+    playerId: player.playerId,
+    amount: curado,
+    hpCurrent: player.hpCurrent,
+    hpMax: player.hpMax,
+    source: 'robo_vida'
+  });
+
+  emitStats(socket);
 }
 
 function clamp(value, min, max) {
@@ -572,6 +733,9 @@ function damageMonster(monster, damage, player, options = {}) {
 
   monster.hp = Math.max(0, monster.hp - damage);
   markInCombat(player);
+
+  // El que golpea con robo de vida se cura con lo que acaba de hacer
+  if (player) applyLifeSteal(player, damage);
 
   emitToMap(monster.mapId, 'monsterDamaged', {
     monsterId: monster.id,
@@ -643,17 +807,24 @@ async function persistVitals(player) {
 function damagePlayer(target, damage, attacker, options = {}) {
   if (!target) return false;
 
-  target.hpCurrent = Math.max(0, target.hpCurrent - damage);
+  // El equipo del que recibe recorta el golpe antes de tocar la vida
+  const danoFinal = mitigatedDamage(target, damage);
+
+  target.hpCurrent = Math.max(0, target.hpCurrent - danoFinal);
   markInCombat(target);
+
+  // El que golpea con robo de vida también se cura en PvP
+  if (attacker) applyLifeSteal(attacker, danoFinal);
 
   emitToMap(target.mapId, 'playerDamaged', {
     playerId: target.playerId,
     characterId: target.characterId,
-    damage,
+    damage: danoFinal,
     hpCurrent: target.hpCurrent,
     hpMax: target.hpMax,
     attackerId: attacker ? attacker.playerId : null,
-    skillId: options.skillId || null
+    skillId: options.skillId || null,
+    critical: Boolean(options.critical)
   });
 
   // Golpear a un ciudadano sin ser renegado mancha el karma; un renegado ya no
@@ -712,6 +883,9 @@ function spawnProjectile(player, skill, targetX, targetY) {
   if (distance < 1) return null;
 
   const id = randomUUID();
+  // El crítico se decide al disparar y viaja con el proyectil: si no, el golpe
+  // sale multiplicado pero llega al cliente como un golpe normal
+  const critical = Math.random() < critChanceFor(player, skill);
 
   projectiles[id] = {
     id,
@@ -719,7 +893,8 @@ function spawnProjectile(player, skill, targetX, targetY) {
     skillId: skill.id,
     kind: skill.projectile,
     ownerId: player.playerId,
-    damage: skillDamage(player, skill, false),
+    damage: skillDamage(player, skill, critical),
+    critical,
     x: player.x,
     y: player.y,
     dirX: dx / distance,
@@ -787,9 +962,15 @@ function tickProjectiles() {
       const owner = players[projectile.ownerId] || null;
 
       if (monster) {
-        damageMonster(monster, projectile.damage, owner, { skillId: projectile.skillId });
+        damageMonster(monster, projectile.damage, owner, {
+          skillId: projectile.skillId,
+          critical: projectile.critical
+        });
       } else {
-        damagePlayer(target, projectile.damage, owner, { skillId: projectile.skillId });
+        damagePlayer(target, projectile.damage, owner, {
+          skillId: projectile.skillId,
+          critical: projectile.critical
+        });
       }
 
       emitToMap(projectile.mapId, 'projectileHit', {
@@ -799,6 +980,7 @@ function tickProjectiles() {
         y: projectile.y,
         hit: true,
         damage: projectile.damage,
+        critical: Boolean(projectile.critical),
         targetId: monster ? monster.id : target.playerId,
         targetType: monster ? 'monster' : 'player'
       });
@@ -841,7 +1023,7 @@ function castArc(player, skill, targetX, targetY) {
     const angle = Math.atan2(monster.y - player.y, monster.x - player.x);
     if (Math.abs(normalizeAngle(angle - aim)) > skill.arcHalfAngle) return;
 
-    const critical = Math.random() < skill.critChance;
+    const critical = Math.random() < critChanceFor(player, skill);
     hits.push({ monster, damage: skillDamage(player, skill, critical), critical });
   });
 
@@ -902,7 +1084,12 @@ function castBlink(player, skill, targetX, targetY, targetEntityId) {
 
   const target = meleeTarget(player, skill.hitRange, targetEntityId);
   if (target) {
-    damageMonster(target, skillDamage(player, skill, false), player, { skillId: skill.id });
+    const critical = Math.random() < critChanceFor(player, skill);
+
+    damageMonster(target, skillDamage(player, skill, critical), player, {
+      critical,
+      skillId: skill.id
+    });
   }
 }
 
@@ -1172,6 +1359,8 @@ function emitStats(socket) {
   const player = players[socket.id];
   if (!player) return;
 
+  const perfil = combatProfile(player);
+
   socket.emit('playerStatsUpdated', {
     level: player.level,
     experience: player.experience,
@@ -1186,7 +1375,19 @@ function emitStats(socket) {
     hpCurrent: player.hpCurrent,
     hpMax: player.hpMax,
     mpCurrent: player.mpCurrent,
-    mpMax: player.mpMax
+    mpMax: player.mpMax,
+    // Lo que aporta el equipo: la ventana de personaje lo pinta tal cual, así que
+    // el jugador ve por qué su daño sube al forjar o al ponerse un sufijo
+    combat: {
+      weaponMin: perfil.weaponMin,
+      weaponMax: perfil.weaponMax,
+      defense: perfil.defense,
+      mitigation: perfil.defense / (perfil.defense + ARMOR_MITIGATION_K),
+      critChance: perfil.critChance,
+      lifeSteal: perfil.lifeSteal,
+      speed: perfil.speed,
+      bonuses: perfil.bonuses
+    }
   });
 }
 
@@ -1478,8 +1679,11 @@ io.on('connection', async (socket) => {
   // JSON no puede serializar.
   socket.to(mapRoom(mapId)).emit('newPlayer', publicPlayer(players[socket.id]));
 
-  // Inventario y estadísticas del personaje
+  // Inventario y estadísticas del personaje. El perfil de combate se carga antes
+  // que las estadísticas: el panel tiene que enseñar el daño real desde el primer
+  // segundo, no un cero hasta el primer cambio de equipo.
   emitInventory(socket, 'currentInventory');
+  await refreshCombatProfile(players[socket.id]);
   emitStats(socket);
 
   // Clanes (Módulo H): la ficha del clan y las invitaciones que quedaron pendientes
@@ -1609,9 +1813,10 @@ io.on('connection', async (socket) => {
       if (!m.alive) return;
       if (Math.hypot(player.x - m.x, player.y - m.y) > 60) return;
 
-      // Daño entre 10 y 25. El golpe básico no depende del atributo: el daño por
-      // atributo es lo que distingue a las habilidades de cada clase.
-      damageMonster(m, Math.floor(Math.random() * 15) + 10, player);
+      // Daño entre 10 y 25 más la tirada del arma. El golpe básico no depende del
+      // atributo (eso es cosa de las habilidades), pero la espada en la mano sí
+      // se nota: la forja tiene que verse en cada golpe, no solo en la habilidad.
+      damageMonster(m, Math.floor(Math.random() * 15) + 10 + weaponRoll(player), player);
     });
   });
 
@@ -1878,6 +2083,8 @@ io.on('connection', async (socket) => {
 
     notify(socket, `Equipas ${equippedName}.`, '#a5d6a7');
     emitInventory(socket);
+    await refreshCombatProfile(player);
+    emitStats(socket);
   });
 
   // Desequipar un ítem del paperdoll (clic en el inventario)
@@ -1928,6 +2135,8 @@ io.on('connection', async (socket) => {
 
     notify(socket, `Desequipas ${unequippedName}.`);
     emitInventory(socket);
+    await refreshCombatProfile(player);
+    emitStats(socket);
   });
 
   // La ventana de forja pregunta antes de gastar: probabilidad, gema y precio del
@@ -2035,6 +2244,10 @@ io.on('connection', async (socket) => {
     notify(socket, forgeOutcomeText(outcome), outcome.exito ? '#ffd54f' : '#ff5252');
 
     emitInventory(socket);
+
+    // Forjar cambia el daño o la defensa del ítem puesto: el perfil se recarga
+    // antes de mandar las estadísticas, si no el panel miente
+    await refreshCombatProfile(player);
     emitStats(socket);
   });
 
