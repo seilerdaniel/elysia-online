@@ -28,6 +28,9 @@ export default class GameScene extends Phaser.Scene {
     this.playerStats = null;
     this.keybinds = null;
     this.chatInputHandlers = null;
+    this.projectiles = null;
+    this.skillInfo = null;
+    this.localBars = null;
     this.speed = 160;
     this.isChatting = false;
     this.activeCharacter = null;
@@ -92,6 +95,7 @@ export default class GameScene extends Phaser.Scene {
     this.monstersGroup = new Map();
     this.worldDropSprites = new Map();
     this.npcSprites = new Map();
+    this.projectiles = new Map();
 
     // 4. Conectar WebSockets pasando Token JWT y datos del personaje
     this.socket = io('http://localhost:5000', {
@@ -191,7 +195,7 @@ export default class GameScene extends Phaser.Scene {
       const monsterData = this.monstersGroup.get(data.monsterId);
       if (monsterData) {
         this.updateMonsterHpBar(monsterData, data.currentHp, data.maxHp);
-        this.showDamageText(monsterData.sprite.x, monsterData.sprite.y, data.damage);
+        this.showDamageText(monsterData.sprite.x, monsterData.sprite.y, data.damage, data.critical);
 
         // Destello rojo al sufrir daño
         this.tweens.add({
@@ -217,6 +221,52 @@ export default class GameScene extends Phaser.Scene {
 
     this.socket.on('monsterRespawned', (m) => {
       this.addMonster(m);
+    });
+
+    // --- Eventos de WebSockets: Habilidades y proyectiles (Módulo G) ---
+    this.socket.on('skillInfo', (skill) => {
+      this.skillInfo = skill;
+    });
+
+    this.socket.on('skillDenied', (data) => {
+      // El servidor rechazó el lanzamiento: se avisa sin haber gastado maná
+      if (this.player) {
+        this.showFloatingText(this.player.x, this.player.y - 45, data.text, '#ff8a80', 11, 30);
+      }
+      this.appendChatMessage({ sender: 'SISTEMA', text: data.text, color: '#ff8a80' });
+    });
+
+    this.socket.on('projectileSpawned', (data) => {
+      this.addProjectile(data);
+    });
+
+    this.socket.on('projectileMoved', (data) => {
+      const projectile = this.projectiles.get(data.id);
+      if (!projectile) return;
+
+      // El servidor dice hasta dónde ha llegado; el sprite se desliza hacia ahí
+      projectile.targetX = data.x;
+      projectile.targetY = data.y;
+    });
+
+    this.socket.on('projectileHit', (data) => {
+      this.removeProjectile(data);
+    });
+
+    this.socket.on('skillArc', (data) => {
+      this.playSkillArc(data);
+    });
+
+    this.socket.on('skillBlink', (data) => {
+      this.playSkillBlink(data);
+    });
+
+    this.socket.on('playerDamaged', (data) => {
+      this.showPlayerDamage(data);
+    });
+
+    this.socket.on('playerRespawned', (data) => {
+      this.movePlayerTo(data);
     });
 
     // --- Eventos de WebSockets: Ítems en el suelo ---
@@ -273,6 +323,7 @@ export default class GameScene extends Phaser.Scene {
       this.characterWindow.setStats(stats);
       this.shopWindow.setStats(stats);
       this.updateInventoryPlayer(stats.level);
+      this.updateLocalBars();
     });
 
     // --- Eventos de WebSockets: Sesión ---
@@ -311,6 +362,12 @@ export default class GameScene extends Phaser.Scene {
     // Un único despachador: los atajos son reasignables, así que no se puede
     // registrar un manejador por tecla fija.
     this.input.keyboard.on('keydown', (event) => this.handleKeyDown(event));
+
+    // Clic derecho: lanza la habilidad de clase apuntando al cursor
+    this.input.mouse.disableContextMenu();
+    this.input.on('pointerdown', (pointer) => {
+      if (pointer.rightButtonDown()) this.castSkill(pointer);
+    });
   }
 
   // --- Teclado -----------------------------------------------------------------
@@ -338,6 +395,9 @@ export default class GameScene extends Phaser.Scene {
     switch (findActionByKey(this.keybinds, code)) {
       case 'attack':
         this.performAttack();
+        break;
+      case 'skill':
+        this.castSkill();
         break;
       case 'inventory':
         if (this.inventoryWindow.toggle()) this.closeOtherWindows('inventory');
@@ -495,6 +555,10 @@ export default class GameScene extends Phaser.Scene {
         strokeThickness: 3
       }
     ).setOrigin(0.5);
+
+    // Barras de vida y maná sobre la cabeza (Módulo G)
+    this.buildLocalBars();
+    this.updateLocalBars();
   }
 
   addOtherPlayer(playerInfo) {
@@ -544,24 +608,273 @@ export default class GameScene extends Phaser.Scene {
     monsterData.hpBar.width = 32 * pct;
   }
 
-  showDamageText(x, y, damage) {
-    const dmgText = this.add.text(x, y - 20, `-${damage}`, {
-      fontSize: '14px',
-      fill: '#ffeb3b',
+  // Número de daño flotante: amarillo el golpe normal, naranja y grande el crítico
+  showDamageText(x, y, damage, critical = false) {
+    this.showFloatingText(
+      x,
+      y - 20,
+      critical ? `-${damage} ¡CRÍTICO!` : `-${damage}`,
+      critical ? '#ff7043' : '#ffeb3b',
+      critical ? 22 : 14,
+      critical ? 60 : 45
+    );
+  }
+
+  // Texto flotante que asciende y se desvanece. El tamaño y el color son lo que
+  // distingue visualmente un golpe normal de un crítico.
+  showFloatingText(x, y, text, color, fontSize = 14, rise = 45) {
+    const big = fontSize >= 20;
+
+    const label = this.add.text(x, y, text, {
+      fontSize: `${fontSize}px`,
+      fill: color,
       fontStyle: 'bold',
       stroke: '#000000',
-      strokeThickness: 3
-    }).setOrigin(0.5);
+      strokeThickness: big ? 5 : 3
+    }).setOrigin(0.5).setDepth(120);
 
-    // Animación flotante de daño
     this.tweens.add({
-      targets: dmgText,
-      y: y - 45,
+      targets: label,
+      y: y - rise,
       alpha: 0,
-      duration: 800,
+      duration: big ? 1100 : 800,
       ease: 'Power1',
-      onComplete: () => dmgText.destroy()
+      onComplete: () => label.destroy()
     });
+  }
+
+  // --- Habilidades de clase (Módulo G) -----------------------------------------
+
+  // Barras de vida (verde) y maná (azul) sobre la cabeza del jugador local
+  buildLocalBars() {
+    const hpBg = this.add.rectangle(0, 0, 32, 5, 0x000000).setOrigin(0.5);
+    const hpBar = this.add.rectangle(0, 0, 32, 3, 0x00e676).setOrigin(0, 0.5);
+    const mpBg = this.add.rectangle(0, 0, 32, 5, 0x000000).setOrigin(0.5);
+    const mpBar = this.add.rectangle(0, 0, 32, 3, 0x2979ff).setOrigin(0, 0.5);
+
+    this.localBars = { hpBg, hpBar, mpBg, mpBar };
+  }
+
+  updateLocalBars() {
+    if (!this.player || !this.localBars || !this.playerStats) return;
+
+    const { hpBg, hpBar, mpBg, mpBar } = this.localBars;
+    const { hpCurrent, hpMax, mpCurrent, mpMax } = this.playerStats;
+    const { x, y } = this.player;
+
+    hpBg.setPosition(x, y - 40);
+    hpBar.setPosition(x - 16, y - 40);
+    mpBg.setPosition(x, y - 34);
+    mpBar.setPosition(x - 16, y - 34);
+
+    const hpPct = hpMax > 0 ? Phaser.Math.Clamp(hpCurrent / hpMax, 0, 1) : 0;
+    const mpPct = mpMax > 0 ? Phaser.Math.Clamp(mpCurrent / mpMax, 0, 1) : 0;
+
+    hpBar.width = 32 * hpPct;
+    mpBar.width = 32 * mpPct;
+  }
+
+  // Lanza la habilidad de la clase apuntando al cursor. El servidor decide si se
+  // puede lanzar (maná, recarga, distancia): aquí solo se manda el punto.
+  castSkill(pointer) {
+    if (!this.player || this.isChatting) return;
+
+    const aim = pointer || this.input.activePointer;
+    const targetX = aim.worldX;
+    const targetY = aim.worldY;
+
+    // Si el cursor está encima de un monstruo, se apunta a él explícitamente
+    const aimed = this.monsterNear(targetX, targetY);
+    const needsTarget = this.skillInfo && this.skillInfo.kind === 'blink';
+
+    this.cancelLogoutIfPending();
+    this.socket.emit('castSkill', {
+      skillId: this.skillInfo ? this.skillInfo.id : null,
+      targetX,
+      targetY,
+      targetEntityId: needsTarget && aimed ? aimed.id : null
+    });
+  }
+
+  // Monstruo cuyo sprite cae cerca del punto indicado, o null
+  monsterNear(x, y) {
+    let found = null;
+    let closest = 24;
+
+    this.monstersGroup.forEach((monsterData, id) => {
+      const distance = Phaser.Math.Distance.Between(
+        x,
+        y,
+        monsterData.sprite.x,
+        monsterData.sprite.y
+      );
+
+      if (distance <= closest) {
+        closest = distance;
+        found = { id, sprite: monsterData.sprite };
+      }
+    });
+
+    return found;
+  }
+
+  addProjectile(data) {
+    const texture = data.kind === 'arrow' ? 'proj_arrow' : 'proj_arcane';
+    const sprite = this.add.sprite(data.x, data.y, texture).setDepth(20);
+    sprite.rotation = Math.atan2(data.dirY, data.dirX);
+
+    // Rastro de chispas que sigue al proyectil mientras vuela
+    const trail = this.add.particles(0, 0, 'proj_spark', {
+      lifespan: 260,
+      speed: { min: 0, max: 20 },
+      scale: { start: 0.9, end: 0 },
+      alpha: { start: 0.9, end: 0 },
+      quantity: 1,
+      frequency: 25,
+      blendMode: 'ADD'
+    }).setDepth(19);
+
+    trail.startFollow(sprite);
+
+    this.projectiles.set(data.id, {
+      sprite,
+      trail,
+      targetX: data.x,
+      targetY: data.y
+    });
+  }
+
+  // Desliza cada proyectil hacia la última posición confirmada por el servidor:
+  // así el vuelo se ve continuo aunque la simulación vaya a 20 pasos por segundo
+  updateProjectiles(delta) {
+    if (!this.projectiles || this.projectiles.size === 0) return;
+
+    const smooth = Math.min(1, delta / 50);
+
+    this.projectiles.forEach((projectile) => {
+      projectile.sprite.x = Phaser.Math.Linear(projectile.sprite.x, projectile.targetX, smooth);
+      projectile.sprite.y = Phaser.Math.Linear(projectile.sprite.y, projectile.targetY, smooth);
+    });
+  }
+
+  removeProjectile(data) {
+    const projectile = this.projectiles.get(data.id);
+    if (!projectile) return;
+
+    this.projectiles.delete(data.id);
+    projectile.trail.destroy();
+
+    // Se apagó sin tocar nada: solo se desvanece
+    if (!data.hit) {
+      this.tweens.add({
+        targets: projectile.sprite,
+        alpha: 0,
+        scale: 0.4,
+        duration: 120,
+        onComplete: () => projectile.sprite.destroy()
+      });
+      return;
+    }
+
+    projectile.sprite.destroy();
+    this.playImpact(data.x, data.y, data.kind, data.targetType === 'player');
+  }
+
+  // Destello del impacto, del color de la habilidad que lo provocó
+  playImpact(x, y, kind, onPlayer) {
+    const tint = onPlayer ? 0xff5252 : (kind === 'arrow' ? 0xffe082 : 0x64b5f6);
+
+    const burst = this.add.particles(x, y, 'proj_spark', {
+      lifespan: 300,
+      speed: { min: 30, max: 90 },
+      scale: { start: 1.2, end: 0 },
+      alpha: { start: 1, end: 0 },
+      tint,
+      emitting: false,
+      blendMode: 'ADD'
+    }).setDepth(21);
+
+    burst.explode(8);
+    this.time.delayedCall(400, () => burst.destroy());
+  }
+
+  // Corte Vorpal: abanico dorado hacia donde se apuntó
+  playSkillArc(data) {
+    const halfAngle = Math.PI / 3;
+    const graphics = this.add.graphics().setPosition(data.x, data.y).setDepth(21);
+
+    graphics.fillStyle(0xffd700, 0.25);
+    graphics.slice(0, 0, data.range, data.angle - halfAngle, data.angle + halfAngle, false);
+    graphics.fillPath();
+
+    graphics.lineStyle(3, 0xffecb3, 0.9);
+    graphics.beginPath();
+    graphics.arc(0, 0, data.range, data.angle - halfAngle, data.angle + halfAngle, false);
+    graphics.strokePath();
+
+    this.tweens.add({
+      targets: graphics,
+      alpha: 0,
+      duration: 280,
+      ease: 'Power1',
+      onComplete: () => graphics.destroy()
+    });
+  }
+
+  // Ataque Sombrío: estela en el origen y salto a la posición nueva
+  playSkillBlink(data) {
+    const ghost = this.add.sprite(data.fromX, data.fromY, 'player')
+      .setTint(0x6a1b9a)
+      .setAlpha(0.7)
+      .setDepth(9);
+
+    this.tweens.add({
+      targets: ghost,
+      alpha: 0,
+      duration: 320,
+      onComplete: () => ghost.destroy()
+    });
+
+    this.movePlayerTo(data);
+  }
+
+  // Coloca a un jugador donde manda el servidor: teletransporte o derribo
+  movePlayerTo(data) {
+    const target = this.findPlayerById(data.playerId);
+    if (!target) return;
+
+    target.setPosition(data.x, data.y);
+
+    // Solo el derribo trae vida y maná nuevos
+    if (target === this.player && data.hpCurrent !== undefined) {
+      this.playerStats = { ...(this.playerStats || {}), ...data };
+      this.updateLocalBars();
+    }
+  }
+
+  findPlayerById(playerId) {
+    if (this.player && this.player.playerId === playerId) return this.player;
+
+    return this.otherPlayers.getChildren().find(
+      (otherPlayer) => otherPlayer.playerId === playerId
+    ) || null;
+  }
+
+  // Daño recibido por un jugador: número flotante y barra al día
+  showPlayerDamage(data) {
+    const target = this.findPlayerById(data.playerId);
+    if (!target) return;
+
+    this.showDamageText(target.x, target.y, data.damage);
+
+    if (target === this.player) {
+      this.playerStats = {
+        ...(this.playerStats || {}),
+        hpCurrent: data.hpCurrent,
+        hpMax: data.hpMax
+      };
+      this.updateLocalBars();
+    }
   }
 
   findPlayerByCharacterId(characterId) {
@@ -785,7 +1098,11 @@ export default class GameScene extends Phaser.Scene {
     chatLogs.scrollTop = chatLogs.scrollHeight;
   }
 
-  update() {
+  update(time, delta) {
+    // Proyectiles y barras siguen vivos aunque el jugador no pueda moverse
+    this.updateProjectiles(delta);
+    this.updateLocalBars();
+
     if (!this.player || this.isChatting) return;
 
     // Mientras se reasigna un control el personaje no debe andar solo
