@@ -968,18 +968,28 @@ function notifyPlayer(player, text, color = '#ffeb3b') {
   if (socket) notify(socket, text, color);
 }
 
-// Persiste karma y bando: es el único sitio donde se escriben esas columnas
-async function persistKarma(player) {
+// Persiste karma y bando: es el único sitio donde se escriben esas columnas.
+//
+// Los cambios llegan a golpes, y varios pueden caer en el mismo tick (el golpe
+// que derriba resta dos veces: los 2 del impacto y los 25 del derribo). Las
+// escrituras se encadenan por personaje para que la fila acabe siempre en el
+// último valor: dos UPDATE a la vez podían cruzarse y dejar el karma viejo.
+function persistKarma(player) {
   if (!player || !player.characterId) return;
 
-  try {
-    await db.query(
+  // El valor se copia al encolar: cada escritura guarda el karma del momento,
+  // así la última de la cadena es siempre la buena
+  const karma = player.karma;
+  const faction = player.faction;
+
+  player.karmaWrites = (player.karmaWrites || Promise.resolve())
+    .then(() => db.query(
       'UPDATE characters SET karma = $1, faction = $2 WHERE id = $3',
-      [player.karma, player.faction, player.characterId]
-    );
-  } catch (error) {
-    console.error(`⚠️ No se pudo guardar el karma de ${player.name}:`, error.message);
-  }
+      [karma, faction, player.characterId]
+    ))
+    .catch((error) => {
+      console.error(`⚠️ No se pudo guardar el karma de ${player.name}:`, error.message);
+    });
 }
 
 // Mueve el karma y, si el bando cambia, lo anuncia a todos para que los nombres
