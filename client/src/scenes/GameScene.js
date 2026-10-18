@@ -2,6 +2,8 @@ import Phaser from 'phaser';
 import { io } from 'socket.io-client';
 import InventoryWindow from '../ui/InventoryWindow';
 import CharacterWindow from '../ui/CharacterWindow';
+import SettingsWindow from '../ui/SettingsWindow';
+import { findActionByKey, loadKeybinds, resolveKeyCode, saveKeybinds } from '../config/keybinds';
 
 // Debe coincidir con PICKUP_RANGE del servidor
 const PICKUP_RANGE = 40;
@@ -16,7 +18,10 @@ export default class GameScene extends Phaser.Scene {
     this.socket = null;
     this.inventoryWindow = null;
     this.characterWindow = null;
+    this.settingsWindow = null;
     this.playerStats = null;
+    this.keybinds = null;
+    this.chatInputHandlers = null;
     this.speed = 160;
     this.isChatting = false;
     this.activeCharacter = null;
@@ -42,18 +47,32 @@ export default class GameScene extends Phaser.Scene {
       chatWrapper.classList.remove('hidden');
     }
 
+    // El input del chat vive fuera del lienzo y sobrevive al reinicio de la
+    // escena: se guardan las referencias para poder soltarlas en cleanup().
     if (chatInput) {
-      // Detener la propagación de teclas para habilitar WASD, espacio y letras en el chat
-      ['keydown', 'keyup', 'keypress'].forEach((eventType) => {
-        chatInput.addEventListener(eventType, (e) => e.stopPropagation());
-      });
-
-      chatInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
+      const stopPropagation = (event) => event.stopPropagation();
+      const onSend = (event) => {
+        if (event.key === 'Enter') {
           this.toggleChat();
         }
+      };
+
+      this.chatInputHandlers = [
+        ['keydown', stopPropagation],
+        ['keyup', stopPropagation],
+        ['keypress', stopPropagation],
+        ['keydown', onSend]
+      ];
+
+      // Detener la propagación de teclas para habilitar WASD, espacio y letras en el chat
+      this.chatInputHandlers.forEach(([eventType, handler]) => {
+        chatInput.addEventListener(eventType, handler);
       });
     }
+
+    // Cerrar sesión reinicia esta misma escena: los listeners de fuera del
+    // lienzo y el socket deben soltarse en el apagado, no al cerrar la página
+    this.events.once('shutdown', () => this.cleanup());
 
     // 3. Renderizar el Terreno (Grilla 25x20 tiles)
     for (let x = 0; x < 25; x++) {
@@ -84,6 +103,16 @@ export default class GameScene extends Phaser.Scene {
     this.characterWindow.setIdentity({
       name: this.activeCharacter?.name,
       characterClass: this.activeCharacter?.character_class
+    });
+
+    // 7. Menú de opciones en Canvas (se abre con Esc): reasigna controles y cierra sesión
+    this.keybinds = loadKeybinds();
+    this.settingsWindow = new SettingsWindow(this, this.socket, {
+      keybinds: this.keybinds,
+      onKeybindChange: (keybinds) => {
+        this.keybinds = keybinds;
+        saveKeybinds(keybinds);
+      }
     });
 
     // --- Eventos de WebSockets: Jugadores ---
@@ -213,6 +242,16 @@ export default class GameScene extends Phaser.Scene {
       this.updateInventoryPlayer(stats.level);
     });
 
+    // --- Eventos de WebSockets: Sesión ---
+    this.socket.on('logoutCountdown', (data) => {
+      // El servidor exige esperar para salir estando en combate
+      this.settingsWindow.showLogoutCountdown(data.seconds);
+    });
+
+    this.socket.on('logoutSuccess', (data) => {
+      this.handleLogoutSuccess(data.action);
+    });
+
     // --- Eventos de WebSockets: Chat ---
     this.socket.on('chatMessage', (data) => {
       this.appendChatMessage(data);
@@ -227,7 +266,7 @@ export default class GameScene extends Phaser.Scene {
       }
     });
 
-    // 5. Configurar Teclado (Movimiento WASD / Flechas)
+    // 8. Configurar Teclado (Movimiento WASD / Flechas)
     this.cursors = this.input.keyboard.createCursorKeys();
     this.wasd = this.input.keyboard.addKeys({
       up: Phaser.Input.Keyboard.KeyCodes.W,
@@ -236,50 +275,155 @@ export default class GameScene extends Phaser.Scene {
       right: Phaser.Input.Keyboard.KeyCodes.D
     });
 
-    // Tecla Enter para alternar el Chat desde el juego
-    this.input.keyboard.on('keydown-ENTER', () => {
-      if (!this.isChatting) {
-        this.toggleChat();
-      }
-    });
+    // Un único despachador: los atajos son reasignables, así que no se puede
+    // registrar un manejador por tecla fija.
+    this.input.keyboard.on('keydown', (event) => this.handleKeyDown(event));
+  }
 
-    // Tecla Espacio para Atacar
-    this.input.keyboard.on('keydown-SPACE', () => {
-      if (!this.isChatting && this.player) {
-        this.socket.emit('playerAttack');
+  // --- Teclado -----------------------------------------------------------------
 
-        // Animación de golpe en el personaje local
-        this.tweens.add({
-          targets: this.player,
-          scaleX: 1.2,
-          scaleY: 1.2,
-          duration: 80,
-          yoyo: true
-        });
-      }
-    });
+  handleKeyDown(event) {
+    // Al dejar una tecla pulsada el navegador la repite: solo interesa la pulsación
+    if (event.repeat) return;
 
-    // Tecla G para recoger el ítem más cercano dentro del rango
-    this.input.keyboard.on('keydown-G', () => {
-      if (!this.isChatting && this.player) {
+    const code = resolveKeyCode(event);
+
+    // Mientras se reasigna un control, la siguiente tecla es la nueva asignación
+    if (this.settingsWindow.isCapturingKey) {
+      this.settingsWindow.captureKey(code);
+      return;
+    }
+
+    // Esc siempre abre o cierra el menú de opciones
+    if (code === 'Escape') {
+      if (!this.isChatting) this.toggleSettings();
+      return;
+    }
+
+    if (this.isChatting || !this.player) return;
+
+    switch (findActionByKey(this.keybinds, code)) {
+      case 'attack':
+        this.performAttack();
+        break;
+      case 'inventory':
+        if (this.inventoryWindow.toggle()) this.closeOtherWindows('inventory');
+        break;
+      case 'character':
+        if (this.characterWindow.toggle()) this.closeOtherWindows('character');
+        break;
+      case 'pickup':
         this.pickUpNearestDrop();
-      }
-    });
+        break;
+      case 'potionHp':
+        this.usePotion('hp');
+        break;
+      case 'potionMp':
+        this.usePotion('mp');
+        break;
+      case 'chat':
+        this.toggleChat();
+        break;
+      default:
+        break;
+    }
+  }
 
-    // Tecla I para abrir/cerrar el inventario
-    this.input.keyboard.on('keydown-I', () => {
-      if (!this.isChatting && this.player) {
-        // Los dos paneles se dibujan centrados: solo uno visible a la vez
-        if (this.inventoryWindow.toggle()) this.characterWindow.close();
-      }
-    });
+  performAttack() {
+    // Atacar cancela cualquier cierre de sesión en curso
+    this.cancelLogoutIfPending();
 
-    // Tecla C para abrir/cerrar el panel de personaje
-    this.input.keyboard.on('keydown-C', () => {
-      if (!this.isChatting && this.player) {
-        if (this.characterWindow.toggle()) this.inventoryWindow.close();
-      }
+    this.socket.emit('playerAttack');
+
+    // Animación de golpe en el personaje local
+    this.tweens.add({
+      targets: this.player,
+      scaleX: 1.2,
+      scaleY: 1.2,
+      duration: 80,
+      yoyo: true
     });
+  }
+
+  // Consume la primera poción del tipo pedido que haya en la mochila
+  usePotion(stat) {
+    const potion = this.inventoryWindow.items.find(
+      (item) => !item.isEquipped && item.effect && item.effect.stat === stat
+    );
+
+    if (!potion) {
+      this.appendChatMessage({
+        sender: 'SISTEMA',
+        text: stat === 'hp' ? 'No tienes pociones de vida.' : 'No tienes pociones de maná.',
+        color: '#ff5252'
+      });
+      return;
+    }
+
+    this.socket.emit('useItem', { itemId: potion.id });
+  }
+
+  toggleSettings() {
+    if (this.settingsWindow.toggle()) this.closeOtherWindows('settings');
+  }
+
+  // Los tres paneles se dibujan centrados: solo uno puede estar visible a la vez
+  closeOtherWindows(keep) {
+    const panels = {
+      inventory: this.inventoryWindow,
+      character: this.characterWindow,
+      settings: this.settingsWindow
+    };
+
+    Object.entries(panels).forEach(([id, panel]) => {
+      if (id !== keep) panel.close();
+    });
+  }
+
+  cancelLogoutIfPending() {
+    if (this.settingsWindow.isLogoutPending) {
+      this.settingsWindow.clearLogoutRequest();
+    }
+  }
+
+  handleLogoutSuccess(action) {
+    this.socket.disconnect();
+    this.scene.stop();
+
+    // La pantalla de login y la de selección viven fuera del lienzo: las maneja index.js
+    this.game.events.emit('session:returnToAuth', { action, token: this.token });
+  }
+
+  // Suelta todo lo que vive FUERA de la escena: si no, al volver a entrar desde
+  // la selección de personaje se acumularían listeners y sockets.
+  cleanup() {
+    // Al apagarse la escena Phaser destruye los sprites, pero NO crea al
+    // jugador: this.player solo se asigna cuando el socket entrega
+    // currentPlayers. Si se conservara la referencia, update() del siguiente
+    // arranque llamaría a un sprite ya destruido y la excepción mataría el
+    // bucle de Phaser (el juego quedaría congelado).
+    this.player = null;
+
+    const chatWrapper = document.getElementById('chat-wrapper');
+    const chatInput = document.getElementById('chat-input');
+
+    if (chatWrapper) chatWrapper.classList.add('hidden');
+
+    if (chatInput) {
+      if (this.chatInputHandlers) {
+        this.chatInputHandlers.forEach(([eventType, handler]) => {
+          chatInput.removeEventListener(eventType, handler);
+        });
+        this.chatInputHandlers = null;
+      }
+
+      chatInput.style.display = 'none';
+      chatInput.value = '';
+    }
+
+    this.isChatting = false;
+
+    if (this.socket) this.socket.disconnect();
   }
 
   // Mantiene sincronizados nivel y atributos que usa la ventana de inventario
@@ -555,6 +699,12 @@ export default class GameScene extends Phaser.Scene {
   update() {
     if (!this.player || this.isChatting) return;
 
+    // Mientras se reasigna un control el personaje no debe andar solo
+    if (this.settingsWindow.isCapturingKey) {
+      this.player.setVelocity(0);
+      return;
+    }
+
     let moved = false;
     this.player.setVelocity(0);
 
@@ -582,6 +732,9 @@ export default class GameScene extends Phaser.Scene {
     }
 
     if (moved) {
+      // Moverse cancela cualquier cierre de sesión en curso
+      this.cancelLogoutIfPending();
+
       this.socket.emit('playerMovement', {
         x: this.player.x,
         y: this.player.y
