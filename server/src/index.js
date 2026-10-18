@@ -89,30 +89,38 @@ const monsters = {
 
 // Catálogo de ítems. El servidor es la fuente de verdad: ensureItemTemplates()
 // sincroniza estos datos contra item_templates al arrancar y cachea los ids.
+// `price` es el costo base en oro: el comerciante vende a ese precio y compra
+// al 50% (ver salePrice).
 const ITEM_CATALOG = {
   potion_health: {
-    name: 'Poción de Vida', type: 'Pocion', spriteId: 'potion_red',
+    name: 'Poción de Vida', type: 'Pocion', spriteId: 'potion_red', price: 15,
     effect: { stat: 'hp', amount: 30 }, req: { level: 1 }
   },
   potion_mana: {
-    name: 'Poción de Maná', type: 'Pocion', spriteId: 'potion_blue',
+    name: 'Poción de Maná', type: 'Pocion', spriteId: 'potion_blue', price: 12,
     effect: { stat: 'mp', amount: 25 }, req: { level: 1 }
   },
   sword_iron: {
-    name: 'Espada de Hierro', type: 'Arma', spriteId: 'sword',
+    name: 'Espada de Hierro', type: 'Arma', spriteId: 'sword', price: 100,
     req: { level: 1, fuerza: 18 }
   },
   shield_oak: {
-    name: 'Escudo de Roble', type: 'Escudo', spriteId: 'shield',
+    name: 'Escudo de Roble', type: 'Escudo', spriteId: 'shield', price: 80,
     req: { level: 1, fuerza: 15 }
   },
   plate_armor: {
-    name: 'Coraza de Placas', type: 'Armadura', spriteId: 'armor',
+    name: 'Coraza de Placas', type: 'Armadura', spriteId: 'armor', price: 150,
     req: { level: 2, fuerza: 20 }
   },
-  gem_light: { name: 'Gema de Luz', type: 'Gema', spriteId: 'gem', req: { level: 1 } },
-  soul_sphere: { name: 'Esfera de Alma', type: 'Gema', spriteId: 'sphere', req: { level: 1 } },
-  chaos_stone: { name: 'Piedra del Caos', type: 'Gema', spriteId: 'chaos_stone', req: { level: 1 } }
+  gem_light: {
+    name: 'Gema de Luz', type: 'Gema', spriteId: 'gem', price: 30, req: { level: 1 }
+  },
+  soul_sphere: {
+    name: 'Esfera de Alma', type: 'Gema', spriteId: 'sphere', price: 45, req: { level: 1 }
+  },
+  chaos_stone: {
+    name: 'Piedra del Caos', type: 'Gema', spriteId: 'chaos_stone', price: 120, req: { level: 1 }
+  }
 };
 
 // Tipo de ítem -> ranura del paperdoll. Los tipos ausentes no son equipables.
@@ -127,6 +135,22 @@ const EQUIP_SLOT_BY_TYPE = {
 const CATALOG_BY_NAME = Object.fromEntries(
   Object.values(ITEM_CATALOG).map((item) => [item.name, item])
 );
+
+// --- Comerciante (Módulo E) --------------------------------------------------
+// Un NPC fijo en el mapa. El servidor es la autoridad: valida distancia, oro y
+// espacio antes de mover un solo dato.
+const MERCHANT = {
+  id: 'merchant_1',
+  name: 'Comerciante',
+  x: 300,
+  y: 300
+};
+
+const SHOP_RANGE = 50;   // Distancia máxima (px) para comerciar
+const SHOP_BUY_MARGIN = 0.5; // El comerciante paga el 50% del costo base
+
+// Lo que el comerciante vende, en el orden en que se muestra en el panel
+const SHOP_STOCK_KEYS = ['potion_health', 'potion_mana', 'sword_iron', 'shield_oak'];
 
 // Ítems tirados en el suelo, indexados por dropId
 const worldDrops = {};
@@ -364,6 +388,8 @@ function serializeInventoryItem(row) {
     spriteId: row.sprite_id,
     equipSlot: EQUIP_SLOT_BY_TYPE[row.type] || null,
     effect: (catalogItem && catalogItem.effect) || null,
+    // Lo que el comerciante pagaría por este ítem (Módulo E)
+    salePrice: catalogItem ? salePrice(catalogItem) : 0,
     requirements: {
       level: row.req_level,
       fuerza: row.req_fuerza,
@@ -415,6 +441,58 @@ function emitStats(socket) {
 // Mensaje de sistema al jugador (reutiliza el log de chat existente)
 function notify(socket, text, color = '#ffeb3b') {
   socket.emit('chatMessage', { sender: 'SISTEMA', text, color });
+}
+
+// Proyección pública de un NPC
+function publicNpc(npc) {
+  return { id: npc.id, name: npc.name, x: npc.x, y: npc.y };
+}
+
+// Precio al que el comerciante compra: la mitad del costo base, redondeado a
+// la baja para que el jugador nunca gane oro comprando y vendiendo.
+function salePrice(item) {
+  return Math.floor((item.price || 0) * SHOP_BUY_MARGIN);
+}
+
+// Escaparate del comerciante tal como lo consume el cliente (ids ya resueltos
+// por ensureItemTemplates)
+function publicShopCatalog() {
+  return SHOP_STOCK_KEYS.map((key) => {
+    const item = ITEM_CATALOG[key];
+    const req = item.req || {};
+
+    return {
+      templateId: item.templateId,
+      name: item.name,
+      spriteId: item.spriteId,
+      type: item.type,
+      price: item.price,
+      requirements: {
+        level: req.level || 1,
+        fuerza: req.fuerza || 0,
+        agilidad: req.agilidad || 0,
+        inteligencia: req.inteligencia || 0
+      }
+    };
+  });
+}
+
+// Solo se puede comprar lo que el comerciante tiene en el escaparate
+function findStockItem(templateId) {
+  return SHOP_STOCK_KEYS
+    .map((key) => ITEM_CATALOG[key])
+    .find((item) => item.templateId === templateId) || null;
+}
+
+// El comercio exige estar junto al NPC; el cliente solo sugiere la intención
+function isNearMerchant(player) {
+  return Math.hypot(player.x - MERCHANT.x, player.y - MERCHANT.y) <= SHOP_RANGE;
+}
+
+// Resultado de una compra o venta: el panel de tienda lo muestra como
+// confirmación y el chat lo registra como historial
+function shopResult(socket, ok, text) {
+  socket.emit('shopResult', { ok, text });
 }
 
 // Devuelve la lista de requisitos incumplidos por el jugador
@@ -498,6 +576,8 @@ io.on('connection', (socket) => {
   socket.emit('currentPlayers', players);
   socket.emit('currentMonsters', monsters);
   socket.emit('currentDrops', Object.values(worldDrops).map(publicDrop));
+  socket.emit('currentNpcs', [publicNpc(MERCHANT)]);
+  socket.emit('shopCatalog', publicShopCatalog());
   socket.broadcast.emit('newPlayer', players[socket.id]);
 
   // Inventario y estadísticas del personaje
@@ -808,6 +888,200 @@ io.on('connection', (socket) => {
     }
 
     notify(socket, `Desequipas ${unequippedName}.`);
+    emitInventory(socket);
+  });
+
+  // Comprar al comerciante (Módulo E, panel de tienda con la tecla E)
+  socket.on('buyItem', async (payload) => {
+    const templateId = Number(payload && payload.itemTemplateId);
+    const player = players[socket.id];
+
+    if (!player || !player.characterId || !templateId) return;
+
+    if (!isNearMerchant(player)) {
+      shopResult(socket, false, 'Estás demasiado lejos del comerciante.');
+      return;
+    }
+
+    const item = findStockItem(templateId);
+    if (!item) {
+      shopResult(socket, false, 'El comerciante no vende eso.');
+      return;
+    }
+
+    // El oro y el ítem cambian juntos: sin casillero libre no se cobra nada, y la
+    // bolsa se valida contra la base dentro del mismo bloqueo, porque dos clics
+    // seguidos leerían el mismo oro en memoria y podrían gastarlo dos veces.
+    const client = await db.pool.connect();
+    let failure = null;
+    let full = false;
+    let broke = false;
+
+    try {
+      await client.query('BEGIN');
+
+      // Bloquea la fila del personaje: serializa sus transacciones y deja la
+      // elección de casillero libre a salvo de carreras
+      const locked = await client.query(
+        'SELECT gold FROM characters WHERE id = $1 FOR UPDATE',
+        [player.characterId]
+      );
+
+      const available = locked.rows[0] ? Number(locked.rows[0].gold) : 0;
+
+      if (available < item.price) {
+        broke = true;
+        await client.query('ROLLBACK');
+      } else {
+        const inserted = await client.query(
+          `INSERT INTO inventory_items (character_id, item_template_id, slot_index)
+           SELECT $1, $2, slot
+             FROM generate_series(0, 29) AS slot
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM inventory_items i
+                   WHERE i.character_id = $1 AND i.slot_index = slot
+            )
+            ORDER BY slot
+            LIMIT 1
+           RETURNING slot_index`,
+          [player.characterId, item.templateId]
+        );
+
+        if (inserted.rowCount === 0) {
+          full = true;
+          await client.query('ROLLBACK');
+        } else {
+          await client.query(
+            'UPDATE characters SET gold = gold - $2 WHERE id = $1',
+            [player.characterId, item.price]
+          );
+          await client.query('COMMIT');
+        }
+      }
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* ya revertida */ }
+      failure = error;
+    } finally {
+      client.release();
+    }
+
+    if (failure) {
+      console.error(`⚠️ No se pudo completar la compra de ${player.name}:`, failure.message);
+      shopResult(socket, false, 'No se pudo completar la compra.');
+      return;
+    }
+
+    if (full) {
+      shopResult(socket, false, 'Tu inventario está lleno.');
+      return;
+    }
+
+    if (broke) {
+      shopResult(socket, false, `Te falta oro: ${item.name} cuesta ${item.price}.`);
+      return;
+    }
+
+    player.gold -= item.price;
+
+    shopResult(socket, true, `Compras ${item.name} por ${item.price} de oro.`);
+    emitStats(socket);
+    emitInventory(socket);
+  });
+
+  // Vender al comerciante: paga la mitad del costo base del ítem
+  socket.on('sellItem', async (payload) => {
+    const itemId = payload && payload.itemId;
+    const player = players[socket.id];
+
+    if (!player || !player.characterId || !itemId) return;
+
+    if (!isNearMerchant(player)) {
+      shopResult(socket, false, 'Estás demasiado lejos del comerciante.');
+      return;
+    }
+
+    let owned = null;
+    try {
+      const result = await db.query(
+        `SELECT i.id, i.is_equipped, i.enhance_level, t.name, t.sprite_id
+           FROM inventory_items i
+           JOIN item_templates t ON t.id = i.item_template_id
+          WHERE i.id = $1 AND i.character_id = $2`,
+        [itemId, player.characterId]
+      );
+      owned = result.rows[0] || null;
+    } catch (error) {
+      console.error(`⚠️ No se pudo consultar el ítem de ${player.name}:`, error.message);
+      shopResult(socket, false, 'No se pudo completar la venta.');
+      return;
+    }
+
+    if (!owned) return;
+
+    // Solo se vende lo que está en la mochila: lo equipado se desequipa antes
+    if (owned.is_equipped) {
+      shopResult(socket, false, 'Desequipa el ítem antes de venderlo.');
+      return;
+    }
+
+    const catalogItem = CATALOG_BY_NAME[owned.name];
+    if (!catalogItem || salePrice(catalogItem) <= 0) {
+      shopResult(socket, false, 'Ese ítem no tiene valor de venta.');
+      return;
+    }
+
+    const price = salePrice(catalogItem);
+
+    // El DELETE vuelve a comprobar que siga en la mochila: entre la lectura y la
+    // venta el ítem pudo equiparse o consumirse.
+    const client = await db.pool.connect();
+    let failure = null;
+    let gone = false;
+
+    try {
+      await client.query('BEGIN');
+
+      // Misma serialización que en la compra: el oro de dos ventas a la vez no
+      // puede pisarse
+      await client.query('SELECT id FROM characters WHERE id = $1 FOR UPDATE', [player.characterId]);
+
+      const removed = await client.query(
+        'DELETE FROM inventory_items WHERE id = $1 AND character_id = $2 AND is_equipped = FALSE',
+        [itemId, player.characterId]
+      );
+
+      if (removed.rowCount === 0) {
+        gone = true;
+        await client.query('ROLLBACK');
+      } else {
+        await client.query(
+          'UPDATE characters SET gold = gold + $2 WHERE id = $1',
+          [player.characterId, price]
+        );
+        await client.query('COMMIT');
+      }
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* ya revertida */ }
+      failure = error;
+    } finally {
+      client.release();
+    }
+
+    if (failure) {
+      console.error(`⚠️ No se pudo completar la venta de ${player.name}:`, failure.message);
+      shopResult(socket, false, 'No se pudo completar la venta.');
+      return;
+    }
+
+    if (gone) {
+      shopResult(socket, false, 'Ese ítem ya no está en tu mochila.');
+      return;
+    }
+
+    player.gold += price;
+
+    shopResult(socket, true, `Vendes ${owned.name} por ${price} de oro.`);
+    emitStats(socket);
     emitInventory(socket);
   });
 
