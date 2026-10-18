@@ -63,6 +63,33 @@ export default class BootScene extends Phaser.Scene {
     ctxM.fillRect(10, 12, 4, 4);
     ctxM.fillRect(18, 12, 4, 4);
     monsterCanvas.refresh();
+
+    // 13. Comerciante (NPC de la tienda): túnica marrón con ribete dorado
+    const merchantCanvas = this.textures.createCanvas('merchant', 32, 32);
+    const ctxMer = merchantCanvas.getContext();
+    // Túnica
+    ctxMer.fillStyle = '#6d4c41';
+    ctxMer.fillRect(7, 13, 18, 17);
+    // Capa sobre los hombros
+    ctxMer.fillStyle = '#4e342e';
+    ctxMer.fillRect(5, 12, 22, 4);
+    // Ribete dorado
+    ctxMer.fillStyle = '#ffd700';
+    ctxMer.fillRect(7, 15, 18, 2);
+    ctxMer.fillRect(15, 17, 2, 13);
+    // Cabeza y barba blanca
+    ctxMer.fillStyle = '#ffcc80';
+    ctxMer.fillRect(11, 3, 10, 10);
+    ctxMer.fillStyle = '#eceff1';
+    ctxMer.fillRect(11, 10, 10, 3);
+    // Ojos
+    ctxMer.fillStyle = '#000000';
+    ctxMer.fillRect(13, 6, 2, 2);
+    ctxMer.fillRect(17, 6, 2, 2);
+    // Bolsa de oro
+    ctxMer.fillStyle = '#ffd700';
+    ctxMer.fillRect(25, 16, 5, 5);
+    merchantCanvas.refresh();
   }
 
   createItemTextures() {
