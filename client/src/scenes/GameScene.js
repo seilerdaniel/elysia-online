@@ -4,6 +4,7 @@ import InventoryWindow from '../ui/InventoryWindow';
 import CharacterWindow from '../ui/CharacterWindow';
 import SettingsWindow from '../ui/SettingsWindow';
 import ShopWindow from '../ui/ShopWindow';
+import ClanWindow from '../ui/ClanWindow';
 import { findActionByKey, loadKeybinds, resolveKeyCode, saveKeybinds } from '../config/keybinds';
 
 // Debe coincidir con PICKUP_RANGE del servidor
@@ -145,6 +146,12 @@ export default class GameScene extends Phaser.Scene {
 
     // 8. Tienda del comerciante en Canvas (se abre con la tecla E junto al NPC)
     this.shopWindow = new ShopWindow(this, this.socket);
+
+    // 9. Ventana de clan en Canvas (se abre con la tecla K)
+    this.clanWindow = new ClanWindow(this, this.socket);
+
+    this.socket.on('clanInfo', (state) => this.clanWindow.setClanState(state));
+    this.socket.on('clanInviteReceived', (invite) => this.clanWindow.addInvite(invite));
 
     // --- Eventos de WebSockets: Jugadores ---
     this.socket.on('currentPlayers', (players) => {
@@ -446,6 +453,9 @@ export default class GameScene extends Phaser.Scene {
       case 'shop':
         this.toggleShop();
         break;
+      case 'clan':
+        if (this.clanWindow.toggle()) this.closeOtherWindows('clan');
+        break;
       case 'potionHp':
         this.usePotion('hp');
         break;
@@ -498,13 +508,14 @@ export default class GameScene extends Phaser.Scene {
     if (this.settingsWindow.toggle()) this.closeOtherWindows('settings');
   }
 
-  // Los cuatro paneles se dibujan centrados: solo uno puede estar visible a la vez
+  // Todos los paneles se dibujan centrados: solo uno puede estar visible a la vez
   closeOtherWindows(keep) {
     const panels = {
       inventory: this.inventoryWindow,
       character: this.characterWindow,
       settings: this.settingsWindow,
-      shop: this.shopWindow
+      shop: this.shopWindow,
+      clan: this.clanWindow
     };
 
     Object.entries(panels).forEach(([id, panel]) => {

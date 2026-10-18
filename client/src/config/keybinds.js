@@ -23,6 +23,7 @@ export const KEYBIND_ACTIONS = [
   { id: 'character', label: 'Personaje', defaultKey: 'KeyC' },
   { id: 'pickup', label: 'Recoger', defaultKey: 'KeyG' },
   { id: 'shop', label: 'Tienda', defaultKey: 'KeyE' },
+  { id: 'clan', label: 'Clan', defaultKey: 'KeyK' },
   { id: 'potionHp', label: 'Poción HP', defaultKey: 'Digit1' },
   { id: 'potionMp', label: 'Poción MP', defaultKey: 'Digit2' },
   { id: 'chat', label: 'Chat', defaultKey: 'Enter' }
