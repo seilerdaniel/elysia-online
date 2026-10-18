@@ -1,6 +1,7 @@
 import Phaser from 'phaser';
 import { io } from 'socket.io-client';
 import InventoryWindow from '../ui/InventoryWindow';
+import CharacterWindow from '../ui/CharacterWindow';
 
 // Debe coincidir con PICKUP_RANGE del servidor
 const PICKUP_RANGE = 40;
@@ -14,6 +15,7 @@ export default class GameScene extends Phaser.Scene {
     this.worldDropSprites = null;
     this.socket = null;
     this.inventoryWindow = null;
+    this.characterWindow = null;
     this.playerStats = null;
     this.speed = 160;
     this.isChatting = false;
@@ -76,6 +78,13 @@ export default class GameScene extends Phaser.Scene {
     // 5. Ventana de inventario en Canvas (se abre con la tecla I)
     this.inventoryWindow = new InventoryWindow(this, this.socket);
     this.updateInventoryPlayer();
+
+    // 6. Panel de personaje en Canvas (se abre con la tecla C)
+    this.characterWindow = new CharacterWindow(this, this.socket);
+    this.characterWindow.setIdentity({
+      name: this.activeCharacter?.name,
+      characterClass: this.activeCharacter?.character_class
+    });
 
     // --- Eventos de WebSockets: Jugadores ---
     this.socket.on('currentPlayers', (players) => {
@@ -200,6 +209,7 @@ export default class GameScene extends Phaser.Scene {
     this.socket.on('playerStatsUpdated', (stats) => {
       this.playerStats = stats;
       this.inventoryWindow.setStats(stats);
+      this.characterWindow.setStats(stats);
       this.updateInventoryPlayer(stats.level);
     });
 
@@ -259,7 +269,15 @@ export default class GameScene extends Phaser.Scene {
     // Tecla I para abrir/cerrar el inventario
     this.input.keyboard.on('keydown-I', () => {
       if (!this.isChatting && this.player) {
-        this.inventoryWindow.toggle();
+        // Los dos paneles se dibujan centrados: solo uno visible a la vez
+        if (this.inventoryWindow.toggle()) this.characterWindow.close();
+      }
+    });
+
+    // Tecla C para abrir/cerrar el panel de personaje
+    this.input.keyboard.on('keydown-C', () => {
+      if (!this.isChatting && this.player) {
+        if (this.characterWindow.toggle()) this.inventoryWindow.close();
       }
     });
   }

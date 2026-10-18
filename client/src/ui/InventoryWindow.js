@@ -213,6 +213,14 @@ export default class InventoryWindow {
     return this.isOpen;
   }
 
+  close() {
+    if (!this.isOpen) return;
+
+    this.isOpen = false;
+    this.container.setVisible(false);
+    this.hideTooltip();
+  }
+
   // --- Render -----------------------------------------------------------------
 
   findItemForZone(zone) {
